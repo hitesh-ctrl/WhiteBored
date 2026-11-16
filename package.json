@@ -23,7 +23,9 @@
     "probes": "tsx security/probes.ts",
     "xss": "tsx security/xss.ts",
     "bench": "tsx bench/latency.ts",
-    "share": "node scripts/share.mjs"
+    "share": "node scripts/share.mjs",
+    "serve": "node scripts/serve.mjs",
+    "share:public": "NEXT_DIST_DIR=.next-public NEXT_PUBLIC_SOCKET_URL= next build && NEXT_DIST_DIR=.next-public node scripts/serve.mjs"
   },
   "dependencies": {
     "@prisma/adapter-pg": "7.10.1",

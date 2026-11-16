@@ -1,3 +1,4 @@
+import { request } from "node:http";
 import { afterAll, describe, expect, it } from "vitest";
 import { createBoard, emitAck, joinAs, sleep, startTestServer, stroke, type TestServer } from "./helpers";
 
@@ -65,6 +66,65 @@ describe("trusted proxy hops", () => {
     await srv.connect({ "x-forwarded-for": "2001:db8:1:2:3:4:5:6" });
     const same = await srv.connect({ "x-forwarded-for": "2001:db8:1:2:ffff:0:0:1" });
     expect(await dropped(same)).toBe(true);
+  });
+});
+
+/** A raw polling request with the Host and Origin headers chosen by the test. */
+const poll = (url: string, headers: Record<string, string>) =>
+  new Promise<number>((resolve, reject) => {
+    const u = new URL(url);
+    const req = request({ host: u.hostname, port: u.port, path: "/socket.io/?EIO=4&transport=polling", headers }, (res) => { res.resume(); resolve(res.statusCode ?? 0); });
+    req.on("error", reject);
+    req.end();
+  });
+
+describe("fixed-origin mode (a separate web address)", () => {
+  it("accepts only the configured origin, over polling and over websocket, and still accepts non-browser clients", async () => {
+    const srv = await start();
+    expect(await poll(srv.url, { Origin: "http://localhost:3000" })).toBe(200);
+    expect(await poll(srv.url, { Origin: "http://evil.example" })).toBe(403);
+    expect(await poll(srv.url, { Origin: "http://localhost:3000.evil.example" })).toBe(403);
+    expect(await poll(srv.url, {})).toBe(200);
+    expect((await srv.connect({ origin: "http://localhost:3000" })).connected).toBe(true);
+    await expect(srv.connect({ origin: "http://evil.example" })).rejects.toBeTruthy();
+  });
+});
+
+describe("same-origin mode (one address serves the pages and the sockets)", () => {
+  it("compares the whole host: a parent domain or a part of the host is not the same origin", async () => {
+    const srv = await start({ corsOrigin: "same-origin" });
+    const host = "app.example.com";
+    expect(await poll(srv.url, { Host: host, Origin: `https://${host}` })).toBe(200);
+    expect(await poll(srv.url, { Host: host, Origin: "https://example.com" })).toBe(403);
+    expect(await poll(srv.url, { Host: host, Origin: "https://ample.com" })).toBe(403);
+    expect(await poll(srv.url, { Host: host, Origin: "https://app.example.com.evil.net" })).toBe(403);
+    expect(await poll(srv.url, { Host: host, Origin: "https://xapp.example.com" })).toBe(403);
+  });
+  it("accepts a page from the host it is talking to, and no Origin header at all", async () => {
+    const srv = await start({ corsOrigin: "same-origin" });
+    const host = new URL(srv.url).host;
+    const ok = await srv.connect({ origin: `https://${host}` });
+    expect(ok.connected).toBe(true);
+    expect((await srv.connect()).connected).toBe(true);
+  });
+  it("refuses a page from another host, a null origin and a look-alike host", async () => {
+    const srv = await start({ corsOrigin: "same-origin" });
+    const host = new URL(srv.url).host;
+    for (const origin of ["http://evil.example", "null", `http://${host}.evil.example`, `http://x${host}`]) {
+      await expect(srv.connect({ origin })).rejects.toBeTruthy();
+    }
+  });
+  it("answers a polling request from the same host and refuses one from another host", async () => {
+    const srv = await start({ corsOrigin: "same-origin" });
+    const host = new URL(srv.url).host;
+    const url = `${srv.url}/socket.io/?EIO=4&transport=polling`;
+    expect((await fetch(url, { headers: { Origin: `http://${host}` } })).status).toBe(200);
+    expect((await fetch(url, { headers: { Origin: "http://evil.example" } })).status).toBe(403);
+  });
+  it("does not add open CORS headers", async () => {
+    const srv = await start({ corsOrigin: "same-origin" });
+    const res = await fetch(`${srv.url}/socket.io/?EIO=4&transport=polling`, { headers: { Origin: `http://${new URL(srv.url).host}` } });
+    expect(res.headers.get("access-control-allow-origin")).toBeNull();
   });
 });
 

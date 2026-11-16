@@ -1,7 +1,9 @@
 import type { NextConfig } from "next";
+import { socketBase } from "./src/lib/socketUrl";
 
-const socketUrl = process.env.NEXT_PUBLIC_SOCKET_URL ?? "http://localhost:4000";
-const socketWs = socketUrl.replace(/^http/, "ws");
+// With no separate socket address the sockets use the page's own address, which 'self' already allows.
+const socketUrl = socketBase(process.env.NEXT_PUBLIC_SOCKET_URL);
+const socketSources = socketUrl ? ` ${socketUrl} ${socketUrl.replace(/^http/, "ws")}` : "";
 const dev = process.env.NODE_ENV !== "production";
 
 // Next.js emits small inline scripts for hydration, so script-src needs 'unsafe-inline'
@@ -12,7 +14,7 @@ const csp = [
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self'",
-  `connect-src 'self' ${socketUrl} ${socketWs}`,
+  `connect-src 'self'${socketSources}`,
   "object-src 'none'",
   "base-uri 'self'",
   "form-action 'self'",

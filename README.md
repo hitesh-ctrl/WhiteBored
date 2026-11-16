@@ -74,5 +74,8 @@ This builds the app for your computer's network address, starts both servers on 
 
 Sharing over the internet needs the app deployed on a server with https (see Containers below), or a tunnel that exposes both the web port and the socket port. This was not tested.
 
+## Deploying for free
+See [docs/DEPLOY.md](docs/DEPLOY.md): one Render web service plus a free Neon database, or your own computer plus a free tunnel (`npm run share:public`).
+
 ## Containers
 `Dockerfile` has the targets `web`, `socket` and `migrate`; `docker-compose.yml` runs all of them with Postgres. See the comments at the top of both files. `.github/workflows/ci.yml` runs the checks.

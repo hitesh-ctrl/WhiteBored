@@ -12,6 +12,7 @@ import { RECENT_KEY, parseRecent, upsertRecent } from "../lib/recent";
 import { expandSelection, normalizeRect, selectionBounds, strokesInRect } from "../lib/selection";
 import { drawStroke, renderOrder, safeFileName, type Drawable } from "../lib/render";
 import { strokesToSvg } from "../lib/svgExport";
+import { socketBase } from "../lib/socketUrl";
 import { throttle } from "../lib/throttle";
 import { DEFAULT_VIEW, MAX_ZOOM, clampView, wheelAction, zoomAt, type View } from "../lib/viewport";
 import { CANVAS_HEIGHT, CANVAS_WIDTH, MAX_POINTS_PER_STROKE, MAX_TEXT_LENGTH, fontSizeFor } from "../shared/limits";
@@ -23,7 +24,7 @@ import {
   type StrokeInput, type User,
 } from "../shared/protocol";
 
-const SOCKET_URL = process.env.NEXT_PUBLIC_SOCKET_URL ?? "http://localhost:4000";
+const SOCKET_URL = socketBase(process.env.NEXT_PUBLIC_SOCKET_URL); // undefined: the page's own address
 const COLORS = [
   ["Black", "#111827"], ["Red", "#dc2626"], ["Orange", "#ea580c"], ["Yellow", "#ca8a04"],
   ["Green", "#16a34a"], ["Blue", "#2563eb"], ["Purple", "#7c3aed"], ["Pink", "#db2777"],

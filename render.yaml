@@ -1,0 +1,14 @@
+# Render Blueprint: one free web service running the whole app (see docs/DEPLOY.md).
+# DATABASE_URL is not stored here: paste your database connection string in the Render dashboard.
+services:
+  - type: web
+    name: whiteboard
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: RUN_MIGRATIONS
+        value: "true"

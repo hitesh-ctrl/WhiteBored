@@ -20,7 +20,10 @@ type Ackfn = ((r: never) => void) | undefined;
 
 export interface WhiteboardServerOptions {
   prisma: PrismaClient;
-  /** The single browser origin that may connect. */
+  /**
+   * The single browser origin that may connect, or the word "same-origin" when one server or proxy
+   * serves both the pages and the sockets: then a browser may connect only from the host it is talking to.
+   */
   corsOrigin: string;
   /** Connections allowed from one client address at the same time. */
   maxConnectionsPerIp?: number;
@@ -96,8 +99,9 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
     res.writeHead(404).end();
   });
 
+  const sameOrigin = corsOrigin === "same-origin";
   const io: IoServer = new Server(httpServer, {
-    cors: { origin: corsOrigin, methods: ["GET", "POST"] },
+    ...(sameOrigin ? {} : { cors: { origin: corsOrigin, methods: ["GET", "POST"] } }), // same-origin pages need no CORS headers
     maxHttpBufferSize: MAX_MESSAGE_BYTES,
     // A join sends the whole history; compression keeps that small.
     perMessageDeflate: { threshold: 1024 },
@@ -105,7 +109,13 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
     // where CORS itself does not apply. Non-browser clients send no Origin.
     allowRequest: (req, cb) => {
       const origin = req.headers.origin;
-      cb(null, origin === undefined || origin === corsOrigin);
+      if (origin === undefined) return cb(null, true);
+      if (!sameOrigin) return cb(null, origin === corsOrigin);
+      try {
+        cb(null, new URL(origin).host === req.headers.host); // a page may only connect to the host it came from
+      } catch {
+        cb(null, false); // "null" and other unusable origins
+      }
     },
   });
 

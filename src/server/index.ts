@@ -7,7 +7,7 @@ const port = Number(process.env.SOCKET_PORT ?? 4000);
 const corsOrigin = process.env.CORS_ORIGIN;
 
 if (!corsOrigin) throw new Error("CORS_ORIGIN is not set");
-if (corsOrigin === "*") throw new Error('CORS_ORIGIN must be one exact origin, never "*"');
+if (corsOrigin === "*") throw new Error('CORS_ORIGIN must be one exact origin or "same-origin", never "*"');
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("SOCKET_PORT is invalid");
 
 const maxConnectionsPerIp = Number(process.env.MAX_CONNECTIONS_PER_IP ?? 30);

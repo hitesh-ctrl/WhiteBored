@@ -14,7 +14,7 @@ Design and test approach: `docs/DESIGN.md`, `docs/TEST_PLAN.md`. How to run: `RE
 ## What was tested (measured in the final clean run: `node_modules` removed, `npm ci`)
 | Check | Result |
 |---|---|
-| Unit and server integration tests (vitest, real sockets, real Postgres) | 288 of 288 passed (21 files) |
+| Unit and server integration tests (vitest, real sockets, real Postgres) | 297 of 297 passed (22 files) |
 | TypeScript check | no errors |
 | ESLint with the security plugin | 0 errors, 15 reviewed warnings |
 | `next build` (without any `.env`) | succeeded |
@@ -22,7 +22,7 @@ Design and test approach: `docs/DESIGN.md`, `docs/TEST_PLAN.md`. How to run: `RE
 | Browser end-to-end, newer features (up to four browser contexts) | 26 of 26 passed |
 | Hostile-input probes against a running server | 12 of 12 passed |
 | XSS proof in a real browser | 7 of 7 passed |
-| Mutation checks (rules broken on purpose, tests must fail) | 59 of 59 caught across four rounds (two survived at first and led to new tests) |
+| Mutation checks (rules broken on purpose, tests must fail) | 64 of 64 caught across five rounds (four survived at first and led to new tests) |
 | Sharing through the network address (host, guest on the edit link, watcher on the view-only link, all through 192.168.x.x, not localhost) | worked; the copy-link fallback showed correct links without the owner key |
 | `npm audit --omit=dev` | 0 vulnerabilities |
 | Container images and compose stack (built and run on spare ports) | migration exit 0, web and socket run as the non-root `node` user (uid 1000), no env files or tooling files inside either image, both health checks healthy, security headers and CSP derived from the socket URL at runtime, wrong-origin request refused (403), two browsers drew together through the containers with no page errors, the socket container stops gracefully in 0.2 s with exit code 0, and the stroke and the owner hash (64 characters) were in Postgres afterwards |
@@ -41,6 +41,10 @@ Samples are paced under the per-socket rate limits (1000 progress samples at abo
 | Commit relay, sender to receiver | 300 | 7.898 ms | 9.171 ms | 16.793 ms |
 
 An earlier run of the same benchmark gave p50 0.94 / 6.879 / 6.772 ms (p95 1.887 / 10.065 / 9.934 ms, max 9.998 / 23.842 / 23.792 ms). The two runs differ by up to a factor of two for the relay; the cause (machine load, timer wake-ups after idle gaps, code changes in between) was not isolated, so treat the numbers as a rough scale, not a precise figure. A run before rate limiting existed, with samples sent back to back, was about ten times faster (p50 0.064 ms for the relay) and is not comparable.
+
+## Single-address deployment (for free hosting)
+`Dockerfile` (last stage `app`) and `scripts/serve.mjs` run the pages, the socket server and a small router together behind one address, which is what hosts such as Render give a service; `render.yaml` is the blueprint and `docs/DEPLOY.md` the steps (Render web service plus a free Neon database, or your own computer plus a free tunnel). Sockets then use the page's own address and the server accepts a browser only from the host it is talking to (`CORS_ORIGIN=same-origin`).
+Verified here: the app ran from a fresh image against an empty throwaway Postgres (4 migrations applied at start), as the non-root `node` user, health check healthy, 6 of 6 browser checks through the one address (wrong-origin websocket refused, same-origin accepted, owner, guest and view-only watcher live, no policy violations), about 185 MiB of memory with three browsers, and a graceful stop in 0.17 s with exit code 0. NOT verified: a real Render or Neon deployment, a tunnel service, Safari with the `'self'` websocket policy.
 
 ## Changes made after hands-on use
 - **Hand tool** looked broken at 100% zoom because there is nothing to move around when the whole board is visible. It is now also the select-and-move tool (works at any zoom), empty-space drag moves the view when zoomed in, a plain scroll moves the view, and Ctrl or Cmd with the wheel zooms. The tool hint used to push the drawing area down when it appeared; it now sits under the canvas.
