@@ -55,11 +55,12 @@ For a production build: `npm run build && npm start`.
 Canvas 1600x900 logical units. At most 5000 points per stroke, 5000 strokes and 500,000 points per board, 200 points per progress batch, names 1 to 30 characters.
 
 ## Features
-Pen, eraser, fill, line, arrow, rectangle, ellipse and text; undo and redo; zoom and pan; PNG and SVG export; a laser pointer; named, coloured cursors; recent boards.
+Pen, eraser, fill, line, arrow, rectangle, ellipse and text; 28 colours plus a colour wheel and a colour code box (custom colours are remembered); undo and redo; zoom and pan; PNG and SVG export; a laser pointer; named, coloured cursors; recent boards; pictures to trace.
 
+- **Pictures to trace:** **Add picture** puts a faded picture under the drawing for everyone: upload a JPEG, PNG or WebP (shrunk in your browser, checked again on the server) or pick a built-in outline (house, tree, cat, face, heart, star, grid). Draw over it with any tool. With the Hand tool the person who added a picture, or the board owner, can move it, resize it from the corner square, fade it with the opacity slider or remove it. A board holds up to 8 pictures and 2.5 MB of uploads. Clearing the board keeps its pictures.
 - **Hand tool (select and move):** click one of your strokes to select it and drag to move it; drag empty space to select several; Delete removes the selection. When zoomed in, dragging empty space moves the view and Shift+drag selects. Holding Space moves the view with any tool.
 - **Zoom and scroll:** Ctrl or Cmd with the scroll wheel (or a trackpad pinch) zooms; a plain scroll moves the view when zoomed in.
-- **Fill:** click inside a rectangle, an ellipse or a closed pen loop. The fill belongs to its shape: it moves, undoes, deletes and erases with it.
+- **Fill:** click inside any closed area, even one made of several separate lines. Gaps up to about 12 board units are closed for you, a big pen loop that stops a little short counts as closed, and a click on a line works too. A fill inside a single shape belongs to it: it moves, undoes, deletes and erases with the shape. A new colour replaces the old fill.
 - **Laser:** you see your own red dot and everyone else sees it too; it fades when you stop moving.
 - **Owner and view-only:** the person who creates a board owns it and can clear and rename it. Anyone with the board link can draw. A separate view-only link lets people watch and point with the laser without changing anything.
 

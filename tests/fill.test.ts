@@ -84,3 +84,17 @@ describe("findFillContainer", () => {
     expect(findFillContainer(list, [900, 900])).toBeNull();
   });
 });
+
+describe("closedPolygon is more forgiving about a loop that nearly closes", () => {
+  const loop = (gap: number): [number, number][] => [[0, 0], [400, 0], [400, 400], [0, 400], [0, gap]];
+  it("closes a big loop whose end stops a little short of its start", () => {
+    expect(closedPolygon({ kind: "pen", width: 4, points: loop(40) })).not.toBeNull(); // 40 units short on a 400 square
+  });
+  it("still refuses a loop that stops far short", () => {
+    expect(closedPolygon({ kind: "pen", width: 4, points: loop(200) })).toBeNull();
+  });
+  it("is stricter for small loops, so a scribble is not a shape", () => {
+    expect(closedPolygon({ kind: "pen", width: 4, points: [[0, 0], [60, 0], [60, 60], [0, 60], [0, 40]] })).toBeNull();
+  });
+});
+

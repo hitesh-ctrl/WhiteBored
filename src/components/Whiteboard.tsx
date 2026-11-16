@@ -3,11 +3,13 @@
 import { useEffect, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
 import { copyText } from "../lib/clipboard";
+import { PALETTE, normalizeHex, parseRecentColors, rememberColor } from "../lib/palette";
+import { fillPolygonFromWalls, type FillResult } from "../lib/floodFill";
 import { UploadError, prepareUpload } from "../lib/imageUpload";
 import { clampImageRect, fitRect, onHandle, rectContains, resizeKeepAspect, type Rect } from "../lib/imageLayer";
 import { colorFor } from "../lib/color";
 import { nextBatch, ownStrokeIds, shouldAddPoint, toCanvasPoint } from "../lib/drawing";
-import { findFillContainer } from "../lib/fill";
+import { findFillContainer, pointInPolygon } from "../lib/fill";
 import { strokeHit } from "../lib/geometry";
 import { UndoRedo } from "../lib/history";
 import { newId } from "../lib/ids";
@@ -28,11 +30,8 @@ import {
   type StrokeInput, type User,
 } from "../shared/protocol";
 
+const RECENT_COLORS_KEY = "whiteboard:recentColors";
 const SOCKET_URL = socketBase(process.env.NEXT_PUBLIC_SOCKET_URL); // undefined: the page's own address
-const COLORS = [
-  ["Black", "#111827"], ["Red", "#dc2626"], ["Orange", "#ea580c"], ["Yellow", "#ca8a04"],
-  ["Green", "#16a34a"], ["Blue", "#2563eb"], ["Purple", "#7c3aed"], ["Pink", "#db2777"], ["White", "#ffffff"],
-] as const;
 const TOOLS = [
   ["pen", "Pen"], ["eraser", "Eraser"], ["fill", "Fill"], ["line", "Line"], ["arrow", "Arrow"], ["rect", "Rectangle"],
   ["ellipse", "Ellipse"], ["text", "Text"], ["laser", "Laser"], ["hand", "Hand"],
@@ -71,7 +70,7 @@ export default function Whiteboard(props: Props) {
   const apiRef = useRef<Api>(noApi);
   const initialTool: Tool = viewId ? "laser" : "pen";
   const toolRef = useRef<Tool>(initialTool);
-  const colorRef = useRef<string>(COLORS[0][1]);
+  const colorRef = useRef<string>(PALETTE[0][1]);
   const widthRef = useRef(4);
   const titleRef = useRef(boardName);
   const textDoneRef = useRef(false); // the text box was already committed or cancelled, so blur must not commit again
@@ -81,7 +80,7 @@ export default function Whiteboard(props: Props) {
   const [notice, setNotice] = useState("");
   const [users, setUsers] = useState<User[]>([]);
   const [tool, setTool] = useState<Tool>(initialTool);
-  const [color, setColor] = useState<string>(COLORS[0][1]);
+  const [color, setColor] = useState<string>(PALETTE[0][1]);
   const [width, setWidth] = useState(4);
   const [canUndo, setCanUndo] = useState(false);
   const [canRedo, setCanRedo] = useState(false);
@@ -94,6 +93,7 @@ export default function Whiteboard(props: Props) {
   const [panningUi, setPanningUi] = useState(false);
   const [copied, setCopied] = useState<"edit" | "view" | null>(null);
   const [selCount, setSelCount] = useState(0);
+  const [recentColors, setRecentColors] = useState<string[]>([]);
   const [selPicture, setSelPicture] = useState<ImageMeta | null>(null);
   const [pictureMenu, setPictureMenu] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -102,6 +102,13 @@ export default function Whiteboard(props: Props) {
 
   useEffect(() => { toolRef.current = tool; }, [tool]);
   useEffect(() => { colorRef.current = color; }, [color]);
+  useEffect(() => {
+    let raw: string | null = null;
+    try { raw = localStorage.getItem(RECENT_COLORS_KEY); } catch { /* storage unavailable */ }
+    // Storage only exists in the browser, so the saved colours can only be read after mount.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setRecentColors(parseRecentColors(raw));
+  }, []);
   useEffect(() => { widthRef.current = width; }, [width]);
   useEffect(() => { titleRef.current = title; }, [title]);
   useEffect(() => {
@@ -585,6 +592,34 @@ export default function Whiteboard(props: Props) {
       });
     };
 
+    /* ----- filling any enclosed area ----- */
+    const wallCanvas = document.createElement("canvas");
+    wallCanvas.width = CANVAS_WIDTH / 2; // half size is plenty for finding an area and keeps it quick
+    wallCanvas.height = CANVAS_HEIGHT / 2;
+    const wallCtx = wallCanvas.getContext("2d", { willReadFrequently: true })!;
+    const findArea = (p: Point): FillResult => {
+      wallCtx.setTransform(1, 0, 0, 1, 0, 0);
+      wallCtx.clearRect(0, 0, wallCanvas.width, wallCanvas.height);
+      wallCtx.setTransform(0.5, 0, 0, 0.5, 0, 0);
+      for (const s of strokes) if (s.kind !== "fill") drawStroke(wallCtx, { ...s, color: "#000000" }); // every line is a wall
+      const px = wallCtx.getImageData(0, 0, wallCanvas.width, wallCanvas.height).data;
+      const walls = new Uint8Array(wallCanvas.width * wallCanvas.height);
+      for (let i = 0; i < walls.length; i++) walls[i] = px[i * 4 + 3] > 40 ? 1 : 0;
+      return fillPolygonFromWalls(walls, wallCanvas.width, wallCanvas.height, p[0] / 2, p[1] / 2, { close: 3, grow: 5 }); // gaps up to about 12 units are closed
+    };
+    const fillOpenArea = (p: Point) => {
+      const found = findArea(p);
+      if (!found.ok) {
+        setNotice(found.reason === "wall" ? "Click inside an area, not in the middle of a thick line." : found.reason === "tiny" ? "That area is too small to fill." : "That area is not closed. Close the gap in the outline (small gaps are closed for you) or click inside a shape.");
+        return;
+      }
+      const points = found.points.map(([x, y]): Point => [Math.min(CANVAS_WIDTH, Math.round(x * 20) / 10), Math.min(CANVAS_HEIGHT, Math.round(y * 20) / 10)]);
+      // a new colour replaces this person's earlier fill of the same area instead of stacking on it
+      const old = strokes.filter((s) => s.kind === "fill" && !s.containerId && isSelectable(s) && pointInPolygon(p, s.points)).pop();
+      if (old) removeOwn(old, true, false);
+      commitLocal({ id: newId(), kind: "fill", color: colorRef.current, width: 1, points });
+    };
+
     /* ----- selecting and moving ----- */
     const isSelectable = (s: Stroke) => s.authorId === clientId && !pending.has(s.id) && !erasing.has(s.id);
     /** The person's own stroke under the pointer: the one drawn last, lines before fills. */
@@ -1018,8 +1053,9 @@ export default function Whiteboard(props: Props) {
       }
       if (t === "fill") {
         e.preventDefault();
-        const container = findFillContainer(strokes, point(e));
-        if (!container) return setNotice("Click inside a closed shape: a rectangle, an ellipse or a loop drawn with the pen.");
+        const clicked = point(e);
+        const container = findFillContainer(strokes, clicked);
+        if (!container) return fillOpenArea(clicked); // not inside one closed shape: fill whatever area the lines enclose
         // a new colour replaces this person's earlier fill of the same shape instead of stacking on it
         for (const old of strokes.filter((s) => s.kind === "fill" && s.containerId === container.id && isSelectable(s))) removeOwn(old, true, false);
         commitLocal({ id: newId(), kind: "fill", color: colorRef.current, width: 1, containerId: container.id, points: container.polygon });
@@ -1225,6 +1261,17 @@ export default function Whiteboard(props: Props) {
     };
   }, [boardId, viewId, clientId, name, ownerKey]);
 
+  /** Pick any colour (from the wheel or a typed code); custom ones are remembered for next time. */
+  const chooseColor = (value: string) => {
+    const hex = normalizeHex(value);
+    if (!hex) return;
+    setColor(hex);
+    const next = rememberColor(recentColors, hex);
+    if (next.join() !== recentColors.join()) {
+      setRecentColors(next);
+      try { localStorage.setItem(RECENT_COLORS_KEY, JSON.stringify(next)); } catch { /* storage unavailable */ }
+    }
+  };
   const copy = async (text: string, done: string, which: "edit" | "view") => {
     if (await copyText(text)) {
       setNotice(done);
@@ -1244,7 +1291,7 @@ export default function Whiteboard(props: Props) {
           : "Drag to move around, or just scroll."
         : "Click one of your strokes, or a picture you added, to select it and drag to move it (the square at a picture's corner resizes it). Hold Shift to box-select over a picture. Drag empty space to select several (zoomed in, empty space moves the view and Shift+drag selects). Delete removes the selection. Holding Space moves the view with any tool."
       : tool === "fill"
-        ? "Click inside a rectangle, an ellipse or a loop drawn with the pen to fill it. The fill stays with its shape when you move, erase or delete it."
+        ? "Click inside any closed area to fill it, even one made of several lines. Small gaps are closed for you and a click on a line works too. A fill inside one shape stays with that shape when you move, erase or delete it."
         : tool === "eraser"
           ? "Drag over your own strokes to remove them."
           : tool === "text"
@@ -1306,14 +1353,34 @@ export default function Whiteboard(props: Props) {
         </div>
         {!readOnly && (
           <>
-            <div role="group" aria-label="Colour" className="flex gap-1.5">
-              {COLORS.map(([label, hex]) => (
+            <div role="group" aria-label="Colour" className="flex max-w-md flex-wrap items-center gap-1">
+              {PALETTE.map(([label, hex]) => (
                 <button
-                  key={hex} type="button" aria-label={label} aria-pressed={color === hex}
+                  key={hex} type="button" aria-label={label} aria-pressed={color === hex} title={label}
                   onClick={() => setColor(hex)} style={{ backgroundColor: hex }}
-                  className={`h-7 w-7 rounded-full border-2 ${color === hex ? "border-slate-900 ring-2 ring-slate-400" : hex === "#ffffff" ? "border-slate-300" : "border-white"}`}
+                  className={`h-6 w-6 rounded-full border-2 ${color === hex ? "border-slate-900 ring-2 ring-slate-400" : "border-slate-200"}`}
                 />
               ))}
+              {recentColors.map((hex) => (
+                <button
+                  key={`custom-${hex}`} type="button" aria-label={`Custom colour ${hex}`} aria-pressed={color === hex} title={hex}
+                  onClick={() => setColor(hex)} style={{ backgroundColor: hex }}
+                  className={`h-6 w-6 rounded-md border-2 ${color === hex ? "border-slate-900 ring-2 ring-slate-400" : "border-slate-200"}`}
+                />
+              ))}
+            </div>
+            <div className="flex items-center gap-1 text-sm">
+              <input
+                type="color" aria-label="Colour wheel" title="Colour wheel: pick any colour"
+                value={color} onChange={(e) => chooseColor(e.target.value)}
+                className="h-8 w-10 cursor-pointer rounded border border-slate-300 bg-white p-0"
+              />
+              <input
+                key={color} defaultValue={color} aria-label="Colour code" maxLength={7} spellCheck={false}
+                className="w-[5.5rem] rounded border border-slate-300 bg-white px-1.5 py-1 font-mono text-xs"
+                onBlur={(e) => { if (normalizeHex(e.target.value)) chooseColor(e.target.value); else e.target.value = color; }}
+                onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
+              />
             </div>
             <label className="flex items-center gap-2 text-sm">
               Width

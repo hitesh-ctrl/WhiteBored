@@ -424,6 +424,84 @@ await check("keyboard shortcuts work right after clicking a tool button (Space, 
   await waitUntil(async () => (await rows2()).length === 0, 4000, "Ctrl+Z after clicking a button");
 });
 
+/* ---------- colours, colour wheel and a more lenient fill (board 2 again) ---------- */
+const lastStroke2 = async () => (await rows2()).at(-1);
+const wipe2 = async () => { await pick(C, "Hand"); await C.keyboard.press("Control+a"); await C.keyboard.press("Delete"); await waitUntil(async () => (await rows2()).length === 0, 5000, "board cleared"); await pick(C, "Pen"); };
+await check("a bigger palette, a colour wheel and a colour code box; custom colours are remembered after a reload", async () => {
+  const swatches = await C.getByRole("group", { name: "Colour", exact: true }).getByRole("button").count();
+  if (swatches < 28) throw new Error(`only ${swatches} swatches`);
+  await pick(C, "Pen");
+  await C.getByRole("button", { name: "Teal", exact: true }).click();
+  await stroke(C, [0.1, 0.1], [0.3, 0.1]);
+  await waitUntil(async () => (await lastStroke2())?.color === "#0d9488", 5000, "teal stroke");
+  await C.getByLabel("Colour wheel").fill("#12ab34");
+  await stroke(C, [0.1, 0.2], [0.3, 0.2]);
+  await waitUntil(async () => (await lastStroke2())?.color === "#12ab34", 5000, "wheel colour stroke");
+  await C.getByRole("button", { name: "Custom colour #12ab34" }).waitFor({ timeout: 3000 });
+  const code = C.getByLabel("Colour code");
+  await code.fill("ff8800"); await code.press("Enter");
+  await stroke(C, [0.1, 0.3], [0.3, 0.3]);
+  await waitUntil(async () => (await lastStroke2())?.color === "#ff8800", 5000, "typed colour stroke");
+  await C.getByLabel("Colour code").fill("zzz"); await C.getByLabel("Colour code").press("Enter");
+  if ((await C.getByLabel("Colour code").inputValue()) !== "#ff8800") throw new Error("an invalid code was accepted");
+  await shot(C, "f14-colours");
+  await C.reload();
+  await waitUntil(async () => (await C.locator("header [role=status]").innerText()) === "Connected", 10000, "C back");
+  await C.getByRole("button", { name: "Custom colour #12ab34" }).waitFor({ timeout: 4000 });
+  await wipe2();
+  return `${swatches} swatches; custom colours survive a reload`;
+});
+await check("fill works in an area made of several separate lines, recolours instead of stacking, and also when you click on a line", async () => {
+  await pick(C, "Line");
+  await stroke(C, [0.2, 0.2], [0.5, 0.2]); await stroke(C, [0.5, 0.2], [0.5, 0.5]); await stroke(C, [0.5, 0.5], [0.2, 0.5]); await stroke(C, [0.2, 0.5], [0.2, 0.2]);
+  await waitUntil(async () => (await rows2()).length === 4, 5000, "four lines");
+  await C.getByRole("button", { name: "Red", exact: true }).click();
+  await pick(C, "Fill"); await C.mouse.click(...cat(0.35, 0.35));
+  await waitUntil(async () => (await rows2()).filter((r) => r.kind === "fill").length === 1, 5000, "area filled");
+  const fill = (await rows2()).find((r) => r.kind === "fill")!;
+  if (fill.containerId !== null || fill.color !== "#dc2626") throw new Error(JSON.stringify(fill));
+  await waitUntil(async () => (await alpha(D, 560, 315)) > 0, 4000, "fill visible to Dan");
+  await C.getByRole("button", { name: "Blue", exact: true }).click();
+  await C.mouse.click(...cat(0.4, 0.4));
+  await waitUntil(async () => { const f = (await rows2()).filter((r) => r.kind === "fill"); return f.length === 1 && f[0].color === "#2563eb"; }, 5000, "recoloured, not stacked");
+  await C.getByRole("button", { name: "Green", exact: true }).click();
+  await C.mouse.click(...cat(0.5, 0.35)); // right on the right-hand line
+  await waitUntil(async () => { const f = (await rows2()).filter((r) => r.kind === "fill"); return f.length === 1 && f[0].color === "#16a34a"; }, 5000, "a click on the line fills the area next to it");
+  await shot(D, "f15-fill-several-lines");
+  await wipe2();
+});
+await check("fill closes a small gap in the outline by itself, and says so when the gap is too big", async () => {
+  await pick(C, "Line");
+  await stroke(C, [0.2, 0.2], [0.5, 0.2]); await stroke(C, [0.5, 0.2], [0.5, 0.5]); await stroke(C, [0.5, 0.5], [0.2, 0.5]);
+  await stroke(C, [0.2, 0.5], [0.2, 0.2 + 6 / 900]); // stops 6 board units short of the corner
+  await waitUntil(async () => (await rows2()).length === 4, 5000, "four lines");
+  await pick(C, "Fill"); await C.mouse.click(...cat(0.35, 0.35));
+  await waitUntil(async () => (await rows2()).filter((r) => r.kind === "fill").length === 1, 5000, "small gap closed");
+  await wipe2();
+  await pick(C, "Line");
+  await stroke(C, [0.2, 0.2], [0.5, 0.2]); await stroke(C, [0.5, 0.2], [0.5, 0.5]); await stroke(C, [0.5, 0.5], [0.2, 0.5]);
+  await stroke(C, [0.2, 0.5], [0.2, 0.2 + 90 / 900]); // 90 units short: not closed
+  await waitUntil(async () => (await rows2()).length === 4, 5000, "four lines again");
+  await pick(C, "Fill"); await C.mouse.click(...cat(0.35, 0.35));
+  await C.getByText("That area is not closed.", { exact: false }).waitFor({ timeout: 4000 });
+  await sleep(400);
+  if ((await rows2()).some((r) => r.kind === "fill")) throw new Error("an open area was filled");
+  await wipe2();
+});
+await check("a big pen loop that stops a little short of its start is still a shape, and its fill follows it when moved", async () => {
+  await pick(C, "Pen");
+  const [x0, y0] = cat(0.2, 0.2), [x1, y1] = cat(0.5, 0.2), [x2, y2] = cat(0.5, 0.6), [x3, y3] = cat(0.2, 0.6);
+  await C.mouse.move(x0, y0); await C.mouse.down();
+  for (const [x, y] of [[x1, y0], [x2, y2], [x3, y3], [x0, y0 + 30]]) await C.mouse.move(x, y, { steps: 8 }); // ends 30 px short of the start
+  await C.mouse.up();
+  await waitUntil(async () => (await rows2()).length === 1, 5000, "loop stored");
+  await pick(C, "Fill"); await C.mouse.click(...cat(0.35, 0.4));
+  await waitUntil(async () => (await rows2()).filter((r) => r.kind === "fill").length === 1, 5000, "loop filled");
+  const fill = (await rows2()).find((r) => r.kind === "fill")!, loop = (await rows2()).find((r) => r.kind === "pen")!;
+  if (fill.containerId !== loop.id) throw new Error("a loop that nearly closes should still bind its fill to it");
+  await wipe2();
+});
+
 /* ---------- pictures to trace: a fresh board ---------- */
 const { p: E } = await mk();
 const { p: F } = await mk(1000, 700);

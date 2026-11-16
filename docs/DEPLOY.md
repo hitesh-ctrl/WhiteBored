@@ -17,6 +17,7 @@ Later changes: push to GitHub and Render redeploys. The database schema is appli
 ### What to expect on the free plans
 - **Render free** stops the service after 15 minutes without traffic and needs about a minute to wake up; messages on an open websocket count as traffic. The first visitor after a quiet period waits. Board data is not lost, it lives in Neon. The browser reconnects by itself.
 - **Neon free** gives 1 GB of storage and 100 compute-hours a month per project, and the database pauses after 5 minutes without queries (the next query wakes it). The 1 GB is far more than a few boards need; each board is capped at 500,000 points.
+- **Pictures live in the database.** A board may hold up to 8 pictures and 2.5 MB of uploads; on Neon's free 1 GB that is room for hundreds of boards' worth, but many busy boards would fill it. Delete boards you no longer need.
 - **Do not use Render's own free Postgres** for anything you want to keep: it is deleted 30 days after creation.
 - Memory: the container used about 185 MiB with three browsers connected on a local test; the free instance has 512 MB.
 - The owner of a board is whoever created it in that browser; the owner key lives in the browser's storage. If the browser data is cleared, the owner rights for that board are gone (anyone can still draw).

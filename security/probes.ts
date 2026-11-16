@@ -256,6 +256,51 @@ await probe("knowing a client id is not enough to delete that person's strokes o
   return "join under a present id refused (with and without a key); undo without the key refused; stroke intact";
 });
 
+
+await probe("picture uploads: scripts, disguised files, files that lie about their size, floods and the storage cap", async () => {
+  const b = await prisma.board.create({ data: { name: "upload probe" } });
+  const u = await join(b.id, "Uploader");
+  const be32 = (n: number) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+  const png = (w: number, h: number, total = 0) => Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...be32(13), 0x49, 0x48, 0x44, 0x52, ...be32(w), ...be32(h), 8, 2, 0, 0, 0, 0, 0, 0, 0, ...new Array(Math.max(0, total - 33)).fill(0)]);
+  const geo = { x: 100, y: 100, w: 300, h: 200, opacity: 40 };
+  const add = async (data: unknown, extra: Record<string, unknown> = {}) => (await u.s.timeout(4000).emitWithAck("image:add", { id: randomUUID(), data, ...geo, ...extra }).catch(() => ({ ok: "timeout" }))) as { ok: unknown; error?: string };
+  const hostile: [string, unknown][] = [
+    ["an SVG with a script", Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')],
+    ["HTML", Buffer.from("<html><script>alert(1)</script></html>")],
+    ["a GIF", Buffer.from("GIF89a\x01\x00\x01\x00")],
+    ["a PNG that claims 60000 x 60000 pixels", png(60000, 60000, 200)],
+    ["a PNG over the pixel limit", png(4000, 3000, 500)],
+    ["a PNG over 400 KB", png(100, 100, 400 * 1024 + 1)],
+    ["a text string", "AAAA"], ["an object", { a: 1 }], ["null", null], ["a number", 5],
+  ];
+  const refused: string[] = [];
+  for (const [name, data] of hostile) {
+    // a fresh connection for each file, so the content checks are what refuses it and not the rate limit
+    const fresh = await join(b.id, "Hostile");
+    const r = (await fresh.s.timeout(4000).emitWithAck("image:add", { id: randomUUID(), data, ...geo }).catch(() => ({ ok: "timeout" }))) as { ok: unknown; error?: string };
+    if (r.ok === true) throw new Error(`${name} was accepted`);
+    if (r.error !== "invalid") throw new Error(`${name} was refused as ${JSON.stringify(r)}, not as invalid content`);
+    refused.push(r.error);
+    fresh.s.close();
+    await sleep(250);
+  }
+  const stored = await prisma.boardImage.count({ where: { boardId: b.id } });
+  if (stored !== 0) throw new Error(`${stored} hostile files were stored`);
+  // a flood of adds: only the burst gets through
+  const floodSocket = (await join(b.id, "Flooder")).s;
+  const flood = await Promise.all(Array.from({ length: 40 }, () => floodSocket.timeout(4000).emitWithAck("image:add", { id: randomUUID(), template: "star", ...geo }).catch(() => ({ ok: false, error: "timeout" }))));
+  const accepted = flood.filter((r: { ok: boolean }) => r.ok).length, limited = flood.filter((r: { error?: string }) => r.error === "rate_limited").length;
+  if (accepted < 3 || accepted > 8 || limited < 25) throw new Error(`flood: ${accepted} accepted, ${limited} rate limited`);
+  await prisma.boardImage.deleteMany({ where: { boardId: b.id } });
+  // the per-board storage cap, with direct inserts standing in for earlier uploads
+  await prisma.boardImage.create({ data: { id: randomUUID(), boardId: b.id, authorId: randomUUID(), mime: "image/png", data: Buffer.from([1]), byteSize: 2_450_000, ...geo } });
+  await sleep(6000);
+  const over = await add(png(100, 100, 100 * 1024));
+  if (over.error !== "board_full") throw new Error(`over the storage cap: ${JSON.stringify(over)}`);
+  await prisma.board.delete({ where: { id: b.id } });
+  return `${hostile.length} hostile uploads refused (${[...new Set(refused)].join(", ")}), none stored; ${accepted} of 40 flood adds accepted, ${limited} rate limited; storage cap enforced`;
+});
+
 writeFileSync("logs/security/probes.json", JSON.stringify(results, null, 2));
 open.forEach((s) => s.close());
 server.kill("SIGTERM");

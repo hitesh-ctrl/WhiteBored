@@ -4,7 +4,7 @@ import { MAX_POINTS_PER_STROKE } from "../shared/limits";
 export type FillSource = { kind: string; width: number; points: Point[] };
 
 const ELLIPSE_SEGMENTS = 48;
-const CLOSE_TOLERANCE = 20; // a pen path counts as closed when its end comes back within this distance of its start
+const CLOSE_TOLERANCE = 20; // a pen path counts as closed when its end comes back within this distance of its start (more for big loops, see below)
 const MIN_LOOP_AREA = 100; // ignores tiny scribbles whose end happens to be near their start
 const round1 = (n: number) => Math.round(n * 10) / 10;
 
@@ -37,7 +37,11 @@ export function closedPolygon(s: FillSource): Point[] | null {
     case "pen": {
       if (s.points.length < 3) return null;
       const last = s.points[s.points.length - 1];
-      if (Math.hypot(last[0] - a[0], last[1] - a[1]) > Math.max(CLOSE_TOLERANCE, s.width * 3)) return null;
+      const xs = s.points.map((p) => p[0]), ys = s.points.map((p) => p[1]);
+      const diagonal = Math.hypot(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+      // a big loop may stop a bit short of its start (12% of its size, at most 60 units); a small one must nearly close
+      const tolerance = Math.max(CLOSE_TOLERANCE, s.width * 3, Math.min(60, diagonal * 0.12));
+      if (Math.hypot(last[0] - a[0], last[1] - a[1]) > tolerance) return null;
       return area(s.points) >= MIN_LOOP_AREA ? [...s.points] : null;
     }
     default:
