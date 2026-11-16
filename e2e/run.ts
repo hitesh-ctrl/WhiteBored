@@ -30,7 +30,10 @@ const ctxB = await browser.newContext({ viewport: { width: 900, height: 700 } })
 const A = await ctxA.newPage(), B = await ctxB.newPage();
 A.on("dialog", (d) => d.accept());
 const errors: string[] = [];
-for (const [n, p] of [["A", A], ["B", B]] as const) p.on("pageerror", (e) => errors.push(`${n}: ${e.message}`));
+for (const [n, p] of [["A", A], ["B", B]] as const) {
+  p.on("pageerror", (e) => errors.push(`${n}: ${e.message}`));
+  p.on("console", (m) => { if (m.type() === "error" && /Content Security Policy/i.test(m.text())) errors.push(`${n} CSP: ${m.text()}`); });
+}
 
 let boardUrl = "";
 await check("create board from home page and land on /board/<id>", async () => {
@@ -40,6 +43,14 @@ await check("create board from home page and land on /board/<id>", async () => {
   await A.waitForURL(/\/board\/[0-9a-f-]{36}$/);
   boardUrl = A.url();
   return boardUrl;
+});
+await check("security headers are sent", async () => {
+  const r = await fetch(WEB);
+  const need = ["content-security-policy", "x-content-type-options", "x-frame-options", "referrer-policy"];
+  const missing = need.filter((h) => !r.headers.get(h));
+  if (missing.length) throw new Error(`missing ${missing.join(", ")}`);
+  if (r.headers.get("x-powered-by")) throw new Error("x-powered-by is set");
+  return `x-frame-options=${r.headers.get("x-frame-options")}`;
 });
 await check("unknown board id gives 404", async () => {
   const r = await B.goto(`${WEB}/board/00000000-0000-4000-8000-000000000000`);
@@ -155,7 +166,7 @@ await check("reconnect: kill and restart the socket server", async () => {
   return `graceful exit code ${code}`;
 });
 
-await check("no uncaught page errors", async () => {
+await check("no uncaught page errors and no CSP violations", async () => {
   if (errors.length) throw new Error(errors.join(" | "));
 });
 

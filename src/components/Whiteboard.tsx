@@ -2,7 +2,6 @@
 
 import { useEffect, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
-import { z } from "zod";
 import { nextBatch, ownStrokeIds, shouldAddPoint, toCanvasPoint } from "../lib/drawing";
 import { newId } from "../lib/ids";
 import { throttle } from "../lib/throttle";
@@ -81,9 +80,11 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
     const live = new Map<string, Drawable>(); // key "authorId:strokeId"
     const pending = new Map<string, StrokeInput>(); // committed locally, not yet acknowledged
     const cursors = new Map<string, HTMLDivElement>();
+    const liveSeen = new Map<string, number>(); // last progress time of remote live strokes
     let undoStack: string[] = [];
     let joined = false;
-    let undoWhenSaved = false; // undo was pressed while the newest stroke was still unacknowledged
+    let undoWhenSaved: string | null = null; // id of a stroke whose undo was requested before it was saved
+    let disposed = false;
     let buffer: (() => void)[] = [];
     let raf = 0;
     let drawing: (Drawable & { id: string; sent: number; pointerId: number; timer: ReturnType<typeof setInterval> }) | null = null;
@@ -110,23 +111,31 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
       strokes.push(s);
       drawStroke(cctx, s);
       live.delete(`${s.authorId}:${s.id}`);
+      liveSeen.delete(`${s.authorId}:${s.id}`);
       schedule();
     };
     const removeStroke = (id: string) => {
       const i = strokes.findIndex((s) => s.id === id);
       if (i >= 0) strokes.splice(i, 1);
       pending.delete(id);
+      if (undoWhenSaved === id) undoWhenSaved = null;
       undoStack = undoStack.filter((x) => x !== id);
       setUndoCount(undoStack.length);
       rebuild();
     };
     const clearAll = () => {
       strokes.length = 0;
-      pending.clear();
       undoStack = [];
+      undoWhenSaved = null;
       setUndoCount(0);
       for (const k of [...live.keys()]) if (!k.startsWith(`${clientId}:`)) live.delete(k);
       rebuild();
+      // A stroke of ours that is still being saved may have landed before or after the clear.
+      // Rejoining makes the server's state the truth again and re-sends what is still pending.
+      if (pending.size > 0) {
+        socket.disconnect();
+        socket.connect();
+      }
     };
     const removeCursor = (id: string) => {
       cursors.get(id)?.remove();
@@ -134,7 +143,12 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
     };
     const gate = <A extends unknown[]>(fn: (...a: A) => void) => (...a: A) => {
       if (joined) fn(...a);
-      else buffer.push(() => fn(...a)); // arrived before the join ack; replay in order after it
+      else if (buffer.length < 5000) buffer.push(() => fn(...a)); // arrived before the join ack; replayed in order after it
+      else {
+        buffer = [];
+        socket.disconnect(); // the ack never came; start over instead of growing without limit
+        socket.connect();
+      }
     };
 
     /* ----- server events ----- */
@@ -142,11 +156,16 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
       const p = authoredProgressSchema.safeParse(raw);
       if (!p.success) return;
       const key = `${p.data.authorId}:${p.data.id}`;
+      liveSeen.set(key, Date.now());
       const cur = live.get(key);
       if (cur) {
         if (cur.points.length < MAX_POINTS_PER_STROKE) cur.points.push(...p.data.points.slice(1));
       } else {
-        if (live.size >= MAX_LIVE_STROKES) live.delete(live.keys().next().value!);
+        if (live.size >= MAX_LIVE_STROKES) {
+          const oldest = live.keys().next().value!;
+          live.delete(oldest);
+          liveSeen.delete(oldest);
+        }
         live.set(key, { color: p.data.color, width: p.data.width, points: [...p.data.points] });
       }
       schedule();
@@ -198,14 +217,15 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
     const sendCommit = (s: StrokeInput, attempt = 0) => {
       if (!joined) return; // stays in `pending`, re-sent after the next join
       socket.timeout(5000).emit("stroke:commit", s, (err, res) => {
+        if (disposed) return;
         if (err) {
           if (attempt < 2) sendCommit(s, attempt + 1);
           return;
         }
         if (res.ok) {
           pending.delete(s.id);
-          if (undoWhenSaved) {
-            undoWhenSaved = false;
+          if (undoWhenSaved === s.id) {
+            undoWhenSaved = null;
             apiRef.current.undo();
           }
           return;
@@ -221,12 +241,13 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
         const id = undoStack[undoStack.length - 1];
         if (!joined || !id) return;
         if (pending.has(id)) {
-          undoWhenSaved = true; // the server does not know this stroke yet, undo as soon as it is saved
+          undoWhenSaved = id; // the server does not know this stroke yet, undo as soon as it is saved
           return;
         }
         undoStack.pop();
         setUndoCount(undoStack.length);
         socket.timeout(5000).emit("stroke:undo", { id }, (err, res) => {
+          if (disposed) return;
           if (!err && (res.ok || res.error === "forbidden")) return removeStroke(id);
           undoStack.push(id);
           setUndoCount(undoStack.length);
@@ -235,7 +256,7 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
       clear() {
         if (!joined || !window.confirm("Clear the whole board for everyone?")) return;
         socket.timeout(5000).emit("board:clear", (err, res) => {
-          if (!err && res.ok) clearAll();
+          if (!disposed && !err && res.ok) clearAll();
         });
       },
     };
@@ -246,12 +267,26 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
       buffer = [];
       setStatus("Joining...");
       socket.timeout(10000).emit("board:join", { boardId, clientId, name }, (err, ack) => {
-        if (err) return setStatus("Could not join the board");
+        if (disposed) return;
+        if (err) {
+          setStatus("Could not join the board, retrying...");
+          setTimeout(() => {
+            if (!disposed) {
+              socket.disconnect();
+              socket.connect();
+            }
+          }, 2000);
+          return;
+        }
         if (!ack.ok) return setStatus(ack.error === "not_found" ? "Board not found" : "Could not join the board");
-        const parsed = z.array(authoredStrokeSchema).safeParse(ack.strokes);
         strokes.length = 0;
-        if (parsed.success) strokes.push(...parsed.data);
-        live.clear();
+        for (const raw of ack.strokes) {
+          const one = authoredStrokeSchema.safeParse(raw);
+          if (one.success) strokes.push(one.data); // skip a bad row instead of dropping the board
+        }
+        for (const k of [...live.keys()]) if (!k.startsWith(`${clientId}:`)) live.delete(k);
+        liveSeen.clear();
+        undoWhenSaved = null;
         for (const id of [...cursors.keys()]) removeCursor(id);
         undoStack = ownStrokeIds(strokes, clientId);
         for (const id of pending.keys()) if (!strokes.some((s) => s.id === id)) undoStack.push(id);
@@ -273,6 +308,21 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
     });
     socket.on("connect_error", () => setStatus("Reconnecting..."));
 
+    // A remote stroke whose author never committed it (rejected, or the author lost connection)
+    // would stay on screen forever, so drop live strokes that stopped growing.
+    const sweep = setInterval(() => {
+      const cutoff = Date.now() - 15_000;
+      let changed = false;
+      for (const [k, t] of liveSeen) {
+        if (t < cutoff) {
+          liveSeen.delete(k);
+          live.delete(k);
+          changed = true;
+        }
+      }
+      if (changed) schedule();
+    }, 5000);
+
     /* ----- drawing ----- */
     const point = (e: PointerEvent): Point => toCanvasPoint(e.clientX, e.clientY, canvas.getBoundingClientRect());
     const sendCursor = throttle((p: Point) => socket.volatile.emit("cursor:move", { x: p[0], y: p[1] }), 33);
@@ -281,15 +331,14 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
       if (!drawing) return;
       const b = nextBatch(drawing.points, drawing.sent);
       if (!b) return;
+      if (!joined) return; // not sent, so it is offered again on the next tick
       drawing.sent = b.sent;
-      if (joined) socket.emit("stroke:progress", { id: drawing.id, color: drawing.color, width: drawing.width, points: b.batch });
+      socket.emit("stroke:progress", { id: drawing.id, color: drawing.color, width: drawing.width, points: b.batch });
     };
     const finish = () => {
       if (!drawing) return;
       const d = drawing;
-      drawing = null;
       clearInterval(d.timer);
-      drawing = d;
       flush();
       drawing = null;
       live.delete(`${clientId}:${d.id}`);
@@ -304,7 +353,7 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
     };
 
     const onDown = (e: PointerEvent) => {
-      if (drawing || !joined || (e.pointerType === "mouse" && e.button !== 0)) return;
+      if (drawing || !joined || !e.isPrimary || (e.pointerType === "mouse" && e.button !== 0)) return;
       canvas.setPointerCapture(e.pointerId);
       const d = {
         id: newId(), color: colorRef.current, width: widthRef.current, points: [point(e)] as Point[],
@@ -328,16 +377,22 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
       schedule();
     };
     const onUp = (e: PointerEvent) => {
-      if (drawing && e.pointerId === drawing.pointerId) finish();
+      if (!drawing || e.pointerId !== drawing.pointerId) return;
+      const p = point(e); // keep the final position
+      if (drawing.points.length < MAX_POINTS_PER_STROKE && shouldAddPoint(drawing.points[drawing.points.length - 1], p)) {
+        drawing.points.push(p);
+      }
+      finish();
     };
     canvas.addEventListener("pointerdown", onDown);
     canvas.addEventListener("pointermove", onMove);
     canvas.addEventListener("pointerup", onUp);
     canvas.addEventListener("pointercancel", onUp);
+    canvas.addEventListener("lostpointercapture", onUp);
 
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
-      if (t && (t.tagName === "INPUT" && (t as HTMLInputElement).type === "text" || t.tagName === "TEXTAREA")) return;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
       if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z") {
         e.preventDefault();
         apiRef.current.undo();
@@ -351,6 +406,9 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
       canvas.removeEventListener("pointermove", onMove);
       canvas.removeEventListener("pointerup", onUp);
       canvas.removeEventListener("pointercancel", onUp);
+      canvas.removeEventListener("lostpointercapture", onUp);
+      disposed = true;
+      clearInterval(sweep);
       if (drawing) clearInterval(drawing.timer);
       sendCursor.cancel();
       if (raf) cancelAnimationFrame(raf);
@@ -416,7 +474,7 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
 
       <div className="flex flex-wrap items-center gap-2 text-sm">
         <span className="text-slate-600">On this board:</span>
-        <ul className="flex flex-wrap gap-2">
+        <ul aria-label="People on this board" className="flex flex-wrap gap-2">
           {users.map((u) => (
             <li key={u.id} className="rounded-full bg-slate-200 px-2 py-0.5">{u.name}{u.id === clientId ? " (you)" : ""}</li>
           ))}

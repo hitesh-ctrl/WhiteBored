@@ -1,10 +1,11 @@
 import { createServer } from "node:http";
 import { Server, type Socket } from "socket.io";
 import type { PrismaClient } from "../generated/prisma/client";
+import { createBuckets, type LimitKind } from "./rateLimit";
 import { MAX_MESSAGE_BYTES, MAX_POINTS_PER_BOARD, MAX_STROKES_PER_BOARD } from "../shared/limits";
 import {
   commitSchema, cursorSchema, joinSchema, progressSchema, roomOf, undoSchema,
-  type Ack, type ClientToServerEvents, type ErrorCode, type JoinAck, type ServerToClientEvents,
+  type ClientToServerEvents, type ErrorCode, type JoinAck, type ServerToClientEvents,
   type SocketData, type Stroke, type User,
 } from "../shared/protocol";
 
@@ -44,16 +45,41 @@ export function createWhiteboardServer({ prisma, corsOrigin }: WhiteboardServerO
   const usersOf = (boardId: string): User[] =>
     [...(presence.get(boardId) ?? [])].map(([id, u]) => ({ id, name: u.name }));
 
+  /**
+   * Runs board writes one at a time within this process, so the order of relays always matches
+   * the order of database writes. The advisory lock inside the commit transaction still guards
+   * against other server processes.
+   */
+  const chains = new Map<string, Promise<unknown>>();
+  function inBoardOrder<T>(boardId: string, fn: () => Promise<T>): Promise<T> {
+    const run = (chains.get(boardId) ?? Promise.resolve()).then(fn, fn);
+    const tail = run.then(() => undefined, () => undefined);
+    chains.set(boardId, tail);
+    void tail.then(() => {
+      if (chains.get(boardId) === tail) chains.delete(boardId);
+    });
+    return run;
+  }
+
   io.on("connection", (socket) => {
     registerHandlers(socket);
   });
 
   function registerHandlers(socket: IoSocket) {
     /** Register an event whose first argument is untrusted and whose last argument may be an ack. */
-    const on = (event: keyof ClientToServerEvents, handler: (raw: unknown, ack: Ackfn) => Promise<void> | void) => {
+    const buckets = createBuckets();
+    const on = (
+      event: keyof ClientToServerEvents,
+      limit: LimitKind,
+      handler: (raw: unknown, ack: Ackfn) => Promise<void> | void,
+    ) => {
       (socket as Socket).on(event, async (...args: unknown[]) => {
         const last = args[args.length - 1];
         const ack = typeof last === "function" ? (last as (r: never) => void) : undefined;
+        if (!buckets[limit].take()) {
+          ack?.({ ok: false, error: "rate_limited" } as never); // no-ack events are dropped silently
+          return;
+        }
         try {
           await handler(args[0] === ack ? undefined : args[0], ack);
         } catch (err) {
@@ -69,7 +95,7 @@ export function createWhiteboardServer({ prisma, corsOrigin }: WhiteboardServerO
       return boardId && clientId && name ? { boardId, clientId, name, room: roomOf(boardId) } : null;
     };
 
-    on("board:join", async (raw, ack) => {
+    on("board:join", "join", async (raw, ack) => {
       const parsed = joinSchema.safeParse(raw);
       if (!parsed.success) return fail(ack, "invalid");
       if (socket.data.boardId || socket.data.joining) return fail(ack, "already_joined");
@@ -79,6 +105,7 @@ export function createWhiteboardServer({ prisma, corsOrigin }: WhiteboardServerO
       try {
         const board = await prisma.board.findUnique({ where: { id: boardId }, select: { id: true } });
         if (!board) return fail(ack, "not_found");
+        if (socket.disconnected) return;
 
         // Join the room before reading history so no live event can fall between the two.
         await socket.join(room);
@@ -90,6 +117,11 @@ export function createWhiteboardServer({ prisma, corsOrigin }: WhiteboardServerO
           throw err;
         }
 
+        if (socket.disconnected) {
+          // The client left while we were reading; do not register a user nobody will remove.
+          await socket.leave(room);
+          return;
+        }
         socket.data.boardId = boardId;
         socket.data.clientId = clientId;
         socket.data.name = name;
@@ -97,7 +129,10 @@ export function createWhiteboardServer({ prisma, corsOrigin }: WhiteboardServerO
         const board_ = presence.get(boardId) ?? new Map();
         presence.set(boardId, board_);
         const existing = board_.get(clientId);
-        if (existing) existing.sockets.add(socket.id);
+        if (existing) {
+          existing.sockets.add(socket.id);
+          existing.name = name;
+        }
         else {
           board_.set(clientId, { name, sockets: new Set([socket.id]) });
           socket.to(room).emit("user:joined", { id: clientId, name });
@@ -114,7 +149,7 @@ export function createWhiteboardServer({ prisma, corsOrigin }: WhiteboardServerO
       }
     });
 
-    on("stroke:progress", (raw) => {
+    on("stroke:progress", "progress", (raw) => {
       const c = ctx();
       if (!c) return;
       const parsed = progressSchema.safeParse(raw);
@@ -122,7 +157,7 @@ export function createWhiteboardServer({ prisma, corsOrigin }: WhiteboardServerO
       socket.to(c.room).emit("stroke:progress", { ...parsed.data, authorId: c.clientId });
     });
 
-    on("cursor:move", (raw) => {
+    on("cursor:move", "cursor", (raw) => {
       const c = ctx();
       if (!c) return;
       const parsed = cursorSchema.safeParse(raw);
@@ -130,13 +165,14 @@ export function createWhiteboardServer({ prisma, corsOrigin }: WhiteboardServerO
       socket.to(c.room).volatile.emit("cursor:move", { id: c.clientId, name: c.name, ...parsed.data });
     });
 
-    on("stroke:commit", async (raw, ack) => {
+    on("stroke:commit", "commit", async (raw, ack) => {
       const c = ctx();
       if (!c) return fail(ack, "not_joined");
       const parsed = commitSchema.safeParse(raw);
       if (!parsed.success) return fail(ack, "invalid");
       const s = parsed.data;
 
+      await inBoardOrder(c.boardId, async () => {
       const outcome = await prisma.$transaction(async (tx) => {
         // One writer per board at a time, so the cap check and the insert cannot interleave.
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${c.boardId}, 0))`;
@@ -166,27 +202,32 @@ export function createWhiteboardServer({ prisma, corsOrigin }: WhiteboardServerO
       if (outcome === "forbidden") return fail(ack, "forbidden");
       if (outcome === "created") socket.to(c.room).emit("stroke:commit", { ...s, authorId: c.clientId });
       done(ack);
+      });
     });
 
-    on("stroke:undo", async (raw, ack) => {
+    on("stroke:undo", "mutate", async (raw, ack) => {
       const c = ctx();
       if (!c) return fail(ack, "not_joined");
       const parsed = undoSchema.safeParse(raw);
       if (!parsed.success) return fail(ack, "invalid");
-      const res = await prisma.stroke.deleteMany({
-        where: { id: parsed.data.id, boardId: c.boardId, authorId: c.clientId },
+      await inBoardOrder(c.boardId, async () => {
+        const res = await prisma.stroke.deleteMany({
+          where: { id: parsed.data.id, boardId: c.boardId, authorId: c.clientId },
+        });
+        if (res.count === 0) return fail(ack, "forbidden");
+        socket.to(c.room).emit("stroke:remove", { id: parsed.data.id });
+        done(ack);
       });
-      if (res.count === 0) return fail(ack, "forbidden");
-      socket.to(c.room).emit("stroke:remove", { id: parsed.data.id });
-      done(ack);
     });
 
-    on("board:clear", async (_raw, ack) => {
+    on("board:clear", "mutate", async (_raw, ack) => {
       const c = ctx();
       if (!c) return fail(ack, "not_joined");
-      await prisma.stroke.deleteMany({ where: { boardId: c.boardId } });
-      socket.to(c.room).emit("board:cleared");
-      done(ack);
+      await inBoardOrder(c.boardId, async () => {
+        await prisma.stroke.deleteMany({ where: { boardId: c.boardId } });
+        socket.to(c.room).emit("board:cleared");
+        done(ack);
+      });
     });
 
     socket.on("disconnect", () => {
@@ -207,4 +248,3 @@ export function createWhiteboardServer({ prisma, corsOrigin }: WhiteboardServerO
   return { httpServer, io };
 }
 
-export type { Ack };

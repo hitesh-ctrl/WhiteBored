@@ -306,10 +306,16 @@ describe("board limits", () => {
         id: uuid(), boardId: board.id, authorId: uuid(), color: "#000000", width: 1, points: [[1, 1]], pointCount: 1,
       })),
     });
-    const clients = await Promise.all(Array.from({ length: 8 }, (_, i) => joinAs(srv, board.id, `C${i}`)));
+    // Two server processes sharing one database: only the database lock can order them.
+    const srv2 = await startTestServer();
+    try {
+    const clients = await Promise.all(Array.from({ length: 8 }, (_, i) => joinAs(i % 2 ? srv2 : srv, board.id, `C${i}`)));
     const acks = await Promise.all(clients.map((c) => emitAck(c.socket, "stroke:commit", stroke())));
     expect(acks.filter((a) => a.ok)).toHaveLength(3);
     expect(await srv.prisma.stroke.count({ where: { boardId: board.id } })).toBe(MAX_STROKES_PER_BOARD);
+    } finally {
+      await srv2.close();
+    }
   });
 });
 
@@ -420,5 +426,60 @@ describe("late joiners and reconnects", () => {
     b2.socket.close();
     await sleep(300);
     expect(got).toEqual([{ event: "user:left", data: { id } }]);
+  });
+});
+
+describe("rate limiting", () => {
+  it("answers a commit flood with rate_limited and keeps the board usable for others", async () => {
+    const board = await createBoard(srv.prisma);
+    const flooder = await joinAs(srv, board.id, "Flood");
+    const other = await joinAs(srv, board.id, "Calm");
+    const acks = await Promise.all(Array.from({ length: 60 }, () => emitAck(flooder.socket, "stroke:commit", stroke())));
+    const limited = acks.filter((a) => !a.ok && a.error === "rate_limited").length;
+    const accepted = acks.filter((a) => a.ok).length;
+    expect(accepted).toBeGreaterThanOrEqual(20);
+    expect(accepted).toBeLessThan(35);
+    expect(limited).toBe(60 - accepted);
+    expect(await emitAck(other.socket, "stroke:commit", stroke())).toEqual({ ok: true });
+  });
+
+  it("drops a progress and cursor flood instead of relaying all of it", async () => {
+    const board = await createBoard(srv.prisma);
+    const a = await joinAs(srv, board.id, "Ann");
+    const b = await joinAs(srv, board.id, "Bob");
+    const got = record(b.socket, ["stroke:progress", "cursor:move"]);
+    for (let i = 0; i < 500; i++) {
+      a.socket.emit("stroke:progress", stroke());
+      a.socket.emit("cursor:move", { x: i % 1600, y: 5 });
+    }
+    await sleep(800);
+    const progress = got.filter((g) => g.event === "stroke:progress").length;
+    expect(progress).toBeGreaterThan(0);
+    expect(progress).toBeLessThan(150);
+  });
+
+  it("rate limits repeated bad joins on one socket", async () => {
+    const s = await srv.connect();
+    const acks = [];
+    for (let i = 0; i < 12; i++) acks.push(await emitAck(s, "board:join", { boardId: "bad" }));
+    expect(acks.some((a) => a.error === "rate_limited")).toBe(true);
+  });
+});
+
+describe("disconnect during join", () => {
+  it("does not leave a ghost user behind", async () => {
+    const board = await createBoard(srv.prisma);
+    const a = await joinAs(srv, board.id, "Ann");
+    // Close at slightly different moments so some land while the server is still reading.
+    for (let i = 0; i < 40; i++) {
+      const s = await srv.connect();
+      s.emit("board:join", { boardId: board.id, clientId: uuid(), name: `Ghost${i}` });
+      await sleep(i % 4);
+      s.close();
+    }
+    await sleep(800);
+    const b = await joinAs(srv, board.id, "Bob");
+    expect(b.ack.users.map((u: any) => u.name).sort()).toEqual(["Ann", "Bob"]);
+    expect(a.ack.ok).toBe(true);
   });
 });
