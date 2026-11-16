@@ -134,3 +134,11 @@ Identity (`clientId`, `boardId`, `name`) is stamped from `socket.data` set at jo
 
 ## 8. Out of scope
 Authentication and per-board permissions, board deletion, multi-server scaling (presence is per process; a Redis adapter would be needed), history pagination or snapshots, redo, eraser and shapes, board expiry, accessibility beyond basics (labels, focus, no keyboard drawing), and offline drawing.
+
+## 9. Revisions after review
+- Rate limits (section 3) are implemented as per-socket token buckets in `src/server/rateLimit.ts`; `join` is limited to 2/s with a burst of 5.
+- Within one server process, commit, undo and clear for a board run through a per-board queue, so relays follow database order. The advisory lock still orders writers across processes. Ordering across processes is not guaranteed (out of scope).
+- A client that disconnects while its join is being processed is not registered in presence.
+- Browser: undo requested for a not-yet-saved stroke is bound to that stroke id; a clear that races an unsaved stroke makes the browser re-join; remote live strokes that stop growing for 15 s are dropped; a failed join is retried after 2 s.
+- Presence name is updated when the same client id joins again.
+- Security headers are set in `next.config.ts`.

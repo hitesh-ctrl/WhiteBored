@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.12 <23" },
+  "engines": {
+    "node": ">=22.12 <23"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -16,7 +18,11 @@
     "postinstall": "prisma generate",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "e2e": "tsx e2e/run.ts",
+    "probes": "tsx security/probes.ts",
+    "xss": "tsx security/xss.ts",
+    "bench": "tsx bench/latency.ts"
   },
   "dependencies": {
     "@prisma/adapter-pg": "7.10.1",
