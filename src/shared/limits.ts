@@ -1,0 +1,10 @@
+export const CANVAS_WIDTH = 1600;
+export const CANVAS_HEIGHT = 900;
+export const MAX_POINTS_PER_STROKE = 5000;
+export const MAX_POINTS_PER_BATCH = 200;
+export const MAX_STROKES_PER_BOARD = 5000;
+export const MAX_POINTS_PER_BOARD = 500_000;
+export const MIN_WIDTH = 1;
+export const MAX_WIDTH = 40;
+export const MAX_NAME_LENGTH = 30;
+export const MAX_MESSAGE_BYTES = 256 * 1024;

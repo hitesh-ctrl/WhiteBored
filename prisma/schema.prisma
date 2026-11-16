@@ -1,0 +1,30 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Board {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  createdAt DateTime @default(now())
+  strokes   Stroke[]
+}
+
+model Stroke {
+  seq        Int      @unique @default(autoincrement())
+  id         String   @id @db.Uuid
+  boardId    String   @db.Uuid
+  board      Board    @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  authorId   String   @db.Uuid
+  color      String
+  width      Int
+  points     Json
+  pointCount Int
+  createdAt  DateTime @default(now())
+
+  @@index([boardId, seq])
+}
