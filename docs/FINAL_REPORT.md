@@ -24,6 +24,7 @@ Design and test approach: `docs/DESIGN.md`, `docs/TEST_PLAN.md`. How to run: `RE
 | XSS proof in a real browser | 7 of 7 passed |
 | Mutation checks (rules broken on purpose, tests must fail) | 49 of 49 caught across three rounds |
 | `npm audit --omit=dev` | 0 vulnerabilities |
+| Container images and compose stack (built and run on spare ports) | migration exit 0, web and socket run as the non-root `node` user (uid 1000), no env files or tooling files inside either image, both health checks healthy, security headers and CSP derived from the socket URL at runtime, wrong-origin request refused (403), two browsers drew together through the containers with no page errors, the socket container stops gracefully in 0.2 s with exit code 0, and the stroke and the owner hash (64 characters) were in Postgres afterwards |
 
 The browser checks cover: owner key handling (kept in the browser, only a hash stored), editor versus owner controls, eraser limited to own strokes, redo, shapes with live preview, text with markup staying text, SVG escaping and a valid PNG, zoom and pan landing on the right canvas position, laser, rename, recent boards, a view-only visitor that cannot change anything and never receives the edit id, live updates, persistence, reconnect after killing and restarting the socket server, security headers and no CSP violations.
 
@@ -41,9 +42,8 @@ Samples are paced under the per-socket rate limits (1000 progress samples at abo
 An earlier run of the same benchmark gave p50 0.94 / 6.879 / 6.772 ms (p95 1.887 / 10.065 / 9.934 ms, max 9.998 / 23.842 / 23.792 ms). The two runs differ by up to a factor of two for the relay; the cause (machine load, timer wake-ups after idle gaps, code changes in between) was not isolated, so treat the numbers as a rough scale, not a precise figure. A run before rate limiting existed, with samples sent back to back, was about ten times faster (p50 0.064 ms for the relay) and is not comparable.
 
 ## What was NOT tested
-- **Container images and the compose stack were never built or run.** The Docker storage on the test machine went read-only when the disk filled up, and recovering it needs a restart of Docker Desktop, which was not done. What was checked instead: `docker compose config` validates, and the exact files the socket image copies were assembled in a clean directory with production-only dependencies and run with the image's start command (health, token-protected metrics, a join, commit and undo over a real socket, graceful shutdown on SIGTERM). Image layers, the non-root user, the health checks and the web image are unverified.
 - **The CI workflow was never run**; it was only checked to be valid YAML.
-- Real deployment (hosting, TLS, reverse proxy, forwarded headers, HSTS).
+- Real deployment (hosting, TLS, reverse proxy, forwarded headers, HSTS). The images are large (web 2.4 GB, socket 1.3 GB) because they carry full dependency trees; they were not slimmed.
 - Browsers other than headless Chromium; no Firefox or Safari (the wheel handling for Firefox line mode is untested).
 - Phones, touch screens and pens (including pinch zoom, which does not exist) and input method editors.
 - Real-network latency, packet loss, and load with many users or boards.
@@ -52,8 +52,6 @@ An earlier run of the same benchmark gave p50 0.94 / 6.879 / 6.772 ms (p95 1.887
 - Client logic without dedicated tests (covered by code review and the browser suites): the stale live stroke expiry, the rejoin after a racing clear, join retry, commit retry guard and the per-author live stroke cap.
 
 ## Open findings
-- R2-01 (medium): container images, the non-root check and the compose stack are unverified (see above).
-- R2-02 (medium): the test machine's disk was completely full during this work (it has since been freed); it broke Docker and can break any build.
 - SEC-04 (low): the content security policy allows inline scripts, which Next.js needs for hydration without a nonce setup.
 - SEC-05 (medium): no total cap on connections across all addresses, and presence after a server restart is first come first served until a client leaves.
 - SEC-06 (low): without a trusted proxy, board creation uses one shared allowance for everyone.
