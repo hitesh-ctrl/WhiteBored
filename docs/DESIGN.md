@@ -142,3 +142,52 @@ Authentication and per-board permissions, board deletion, multi-server scaling (
 - Browser: undo requested for a not-yet-saved stroke is bound to that stroke id; a clear that races an unsaved stroke makes the browser re-join; remote live strokes that stop growing for 15 s are dropped; a failed join is retried after 2 s.
 - Presence name is updated when the same client id joins again.
 - Security headers are set in `next.config.ts`.
+
+## 10. Version 2: shapes, text, access control, laser, eraser
+
+### Stroke kinds
+`kind` is one of `pen | line | arrow | rect | ellipse | text` (default `pen`). Stored on the stroke row (`kind`, `text`).
+
+| Kind | Points | Extra | Meaning |
+|---|---|---|---|
+| pen | 1..5000 | none | freehand line |
+| line, arrow | exactly 2 | none | start and end |
+| rect, ellipse | exactly 2 | none | opposite corners (ellipse is inscribed in that box) |
+| text | exactly 1 | `text` 1..200 chars, no control characters | anchor (top left); font size in canvas units is `8 + 2 * width` |
+
+`text` must be absent on every other kind. Live progress for shapes carries the full current points (replace, not append); text has no progress. Rejected: a separate table per kind (joins, ordering across tables), SVG path strings (parsing and injection surface).
+
+### Access control
+- **Edit link** `/board/<id>`: unchanged, knowing the id is edit access.
+- **View-only link** `/view/<viewId>`: `viewId` is a second unguessable uuid on the board that is not derivable from the id. A viewer joins with `viewId` instead of `boardId`, receives history and live events, can move a cursor and laser, and cannot progress, commit, undo, clear or rename (`forbidden`). Editors receive `viewId` in the join ack so they can share it; viewers do not receive the board id. Rejected: a view token in the query string of the edit link (the id in the URL would still grant edit access).
+- **Owner**: a board created through the home page gets a random owner key. Only its SHA-256 hash is stored (`ownerHash`). The creator is redirected to `/board/<id>#owner=<key>`; the browser stores the key in localStorage and removes the fragment (a fragment is never sent to a server). A join with the correct `ownerKey` has role `owner`. Owner-only: `board:clear`, `board:rename`. A wrong or missing key is an ordinary editor, not an error. Boards with no `ownerHash` (created before this version) keep the old rule: any editor may clear, none may rename. Rejected: accounts and sessions (out of scope for a link-based product).
+
+### Join (changed)
+`board:join {boardId? , viewId?, clientId, name, ownerKey?}`: exactly one of `boardId` and `viewId`. Ack on success: `{ok:true, strokes, users, role: "owner"|"editor"|"viewer", canClear: boolean, viewId?: string, boardName: string}`.
+
+### New and changed events
+| Event | Direction | Payload | Ack | Notes |
+|---|---|---|---|---|
+| `board:rename` | client to server | `{name}` (1..30) | `{ok}\|{ok:false,error}` | owner only, `forbidden` otherwise |
+| `board:renamed` | server to client | `{name}` | none | relayed to the room except sender |
+| `laser:move` | client to server | `{x,y}` | none, volatile | any role; shares the cursor rate bucket |
+| `laser:move` | server to client | `{id,name,x,y}` | none, volatile | room except sender |
+| `stroke:progress`, `stroke:commit` | both | gain `kind` and (commit) `text` | unchanged | |
+
+### Eraser and redo (browser only, no new server rule)
+- **Eraser** removes whole strokes by dragging over them, and only strokes the person drew (it sends the existing `stroke:undo`, which the server scopes by author). Rejected: erasing other people's strokes (breaks the ownership rule), partial erase (needs splitting strokes into new rows).
+- **Redo** re-commits the same stroke id after an undo or erase. Because the row was deleted, the id is free; the stroke gets a new `seq`, so it moves to the top of the draw order. Rejected: soft deletes (breaks the append-only, cleanly deletable model).
+
+### Abuse limits (added)
+| Limit | Value |
+|---|---|
+| Concurrent connections per client address | 30 (configurable; the address is the first `X-Forwarded-For` entry only when `trustProxy` is set) |
+| Board creation per client address | 5 per minute, in-memory |
+| Join ack size | WebSocket compression (`perMessageDeflate`, threshold 1 KB) |
+
+### Operations
+- `GET /metrics` on the socket server: plain text counters (connections now and total, joins, commits, rate-limited events, internal errors). No secrets in it.
+- Dockerfiles for both processes (non-root, no `.env` in the image) and a CI workflow that runs typecheck, lint, tests and build against a Postgres service.
+
+### Still out of scope
+Follow mode (viewport sync), a Redis adapter and multi-process presence, history paging or snapshots (compression only reduces the size), accounts, board deletion, SVG-path import.
