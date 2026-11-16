@@ -23,7 +23,7 @@ export type TestServer = {
 
 export async function startTestServer(opts: { maxConnectionsPerIp?: number; trustProxy?: boolean } = {}): Promise<TestServer> {
   const prisma = makePrisma();
-  const { httpServer, io } = createWhiteboardServer({ prisma, corsOrigin: ORIGIN, ...opts });
+  const { httpServer, io } = createWhiteboardServer({ prisma, corsOrigin: ORIGIN, maxConnectionsPerIp: 100_000, ...opts });
   await new Promise<void>((r) => httpServer.listen(0, "127.0.0.1", r));
   const port = (httpServer.address() as AddressInfo).port;
   const url = `http://127.0.0.1:${port}`;

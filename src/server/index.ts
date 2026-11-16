@@ -9,8 +9,12 @@ if (!corsOrigin) throw new Error("CORS_ORIGIN is not set");
 if (corsOrigin === "*") throw new Error('CORS_ORIGIN must be one exact origin, never "*"');
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("SOCKET_PORT is invalid");
 
+const maxConnectionsPerIp = Number(process.env.MAX_CONNECTIONS_PER_IP ?? 30);
+if (!Number.isInteger(maxConnectionsPerIp) || maxConnectionsPerIp < 1) throw new Error("MAX_CONNECTIONS_PER_IP is invalid");
+const trustProxy = process.env.TRUST_PROXY === "true";
+
 const prisma = createPrisma();
-const { httpServer, io } = createWhiteboardServer({ prisma, corsOrigin });
+const { httpServer, io } = createWhiteboardServer({ prisma, corsOrigin, maxConnectionsPerIp, trustProxy });
 
 httpServer.listen(port, () => console.log(`socket server listening on :${port}`));
 
