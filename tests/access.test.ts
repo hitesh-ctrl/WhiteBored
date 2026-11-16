@@ -52,6 +52,17 @@ describe("viewers are read-only", () => {
     expect((await srv.prisma.board.findUniqueOrThrow({ where: { id: board.id } })).name).toBe("Keep me");
   });
 
+  it("a viewer that shares a client id with an author (same browser tab) still cannot undo that author's stroke", async () => {
+    const board = await createBoard(srv.prisma);
+    const author = uuid();
+    const a = await joinAs(srv, board.id, "Ann", author);
+    const s = stroke();
+    await emitAck(a.socket, "stroke:commit", s);
+    const v = await joinWith(srv, { viewId: board.viewId, clientId: author, name: "Ann (view)" });
+    expect(await emitAck(v.socket, "stroke:undo", { id: s.id })).toEqual({ ok: false, error: "forbidden" });
+    expect(await srv.prisma.stroke.count({ where: { id: s.id } })).toBe(1);
+  });
+
   it("cannot send live progress to the others", async () => {
     const board = await createBoard(srv.prisma);
     const a = await joinAs(srv, board.id, "Ann");

@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { io, type Socket } from "socket.io-client";
 import { createPrisma } from "../src/lib/prisma";
@@ -33,8 +33,8 @@ const join = async (boardId: string, name: string, clientId = randomUUID()) => {
   return { s, ack, clientId };
 };
 const stroke = (over = {}) => ({ id: randomUUID(), color: "#112233", width: 4, points: [[1, 1], [2, 2]], ...over });
-const ackEvents = ["board:join", "stroke:commit", "stroke:undo", "board:clear"] as const;
-const plain = ["stroke:progress", "cursor:move"] as const;
+const ackEvents = ["board:join", "stroke:commit", "stroke:undo", "board:clear", "board:rename"] as const;
+const plain = ["stroke:progress", "cursor:move", "laser:move"] as const;
 
 let deep: unknown = "x";
 for (let i = 0; i < 60; i++) deep = { a: deep };
@@ -47,7 +47,7 @@ await probe("malformed payloads never crash the server and never succeed (before
   for (const s of [pre, post]) {
     for (const ev of ackEvents) {
       for (const g of garbage) {
-        if (ev === "board:clear" && s === post) continue; // a valid clear on a joined socket is legal
+        if (ev === "board:clear" && s === post) continue; // a valid clear on a joined socket is legal (legacy board)
         if (ev === "board:join" && s === post) continue;
         const ack = await s.timeout(2000).emitWithAck(ev, g).catch(() => ({ ok: "timeout" }));
         sent++;
@@ -156,6 +156,74 @@ await probe("CORS: wrong origin refused, configured origin allowed, no wildcard"
   try { await connect({ Origin: "http://evil.example" }); } catch { wsBlocked = true; }
   must(wsBlocked, "websocket from wrong origin connected");
   return `evil polling ${evil.status}, evil websocket blocked, good origin echoed, preflight not allowed for evil`;
+});
+
+
+await probe("a view-only socket cannot change anything, whatever it sends", async () => {
+  const b = await prisma.board.create({ data: { name: "viewer probe" } });
+  const editor = await join(b.id, "Editor");
+  const kept = stroke();
+  must((await editor.s.emitWithAck("stroke:commit", kept)).ok, "setup commit failed");
+  const v = await connect();
+  const j = await v.emitWithAck("board:join", { viewId: b.viewId, clientId: randomUUID(), name: "Viewer" });
+  must(j.ok && j.role === "viewer", `join ${JSON.stringify(j)}`);
+  const seen: string[] = [];
+  editor.s.on("stroke:progress", () => seen.push("progress"));
+  editor.s.on("stroke:commit", () => seen.push("commit"));
+  editor.s.on("board:cleared", () => seen.push("cleared"));
+  editor.s.on("board:renamed", () => seen.push("renamed"));
+  const attempts = [
+    ["stroke:commit", stroke()], ["stroke:undo", { id: kept.id }], ["board:clear", undefined],
+    ["board:rename", { name: "owned" }], ["stroke:commit", stroke({ kind: "text", text: "hi", points: [[1, 1]] })],
+  ] as const;
+  const results: unknown[] = [];
+  for (const [ev, payload] of attempts) { results.push((await v.timeout(2000).emitWithAck(ev, payload).catch(() => "timeout")).error); await sleep(250); }
+  v.emit("stroke:progress", stroke());
+  await sleep(400);
+  must(results.every((r) => r === "forbidden"), `acks ${JSON.stringify(results)}`);
+  must(seen.length === 0, `editor saw ${seen}`);
+  must((await prisma.stroke.count({ where: { boardId: b.id } })) === 1, "stroke count changed");
+  must((await prisma.board.findUniqueOrThrow({ where: { id: b.id } })).name === "viewer probe", "board renamed");
+  await prisma.board.delete({ where: { id: b.id } });
+  return "commit, undo, clear, rename, text and progress all refused; board unchanged";
+});
+
+await probe("owner key guessing never grants owner rights", async () => {
+  const realKey = "k".repeat(32);
+  const hash = createHash("sha256").update(realKey).digest("hex");
+  const b = await prisma.board.create({ data: { name: "owner probe", ownerHash: hash } });
+  const guesses: unknown[] = [hash, "x".repeat(128), "a".repeat(16), realKey.slice(1), realKey.toUpperCase(), "", null, [realKey], { $ne: 1 }, realKey + " "];
+  const roles: string[] = [];
+  for (const g of guesses) {
+    const s = await connect();
+    const a = await s.emitWithAck("board:join", { boardId: b.id, clientId: randomUUID(), name: "G", ownerKey: g });
+    roles.push(a.ok ? `${a.role}/${a.canClear}` : `rejected:${a.error}`);
+    const c = a.ok ? await s.emitWithAck("board:clear") : { ok: false };
+    must(!c.ok, `clear worked with guess ${JSON.stringify(g)}`);
+    s.close();
+    await sleep(120);
+  }
+  must(!roles.some((r) => r.startsWith("owner")), `roles ${roles}`);
+  const good = await connect();
+  const a = await good.emitWithAck("board:join", { boardId: b.id, clientId: randomUUID(), name: "Real", ownerKey: realKey });
+  must(a.ok && a.role === "owner", "real key was refused");
+  await prisma.board.delete({ where: { id: b.id } });
+  return `${guesses.length} wrong keys gave ${[...new Set(roles)].join(", ")}; the real key gave owner`;
+});
+
+await probe("edit id and view id are not interchangeable", async () => {
+  const b = await prisma.board.create({ data: { name: "id probe" } });
+  const s1 = await connect();
+  const a1 = await s1.emitWithAck("board:join", { viewId: b.id, clientId: randomUUID(), name: "X" });
+  await sleep(300);
+  const s2 = await connect();
+  const a2 = await s2.emitWithAck("board:join", { boardId: b.viewId, clientId: randomUUID(), name: "X" });
+  await sleep(300);
+  const s3 = await connect();
+  const a3 = await s3.emitWithAck("board:join", { boardId: b.id, viewId: b.viewId, clientId: randomUUID(), name: "X" });
+  must(a1.error === "not_found" && a2.error === "not_found" && a3.error === "invalid", JSON.stringify([a1, a2, a3]));
+  await prisma.board.delete({ where: { id: b.id } });
+  return "view id as edit id and edit id as view id both not_found; both together invalid";
 });
 
 writeFileSync("logs/security/probes.json", JSON.stringify(results, null, 2));
