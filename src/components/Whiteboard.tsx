@@ -83,6 +83,7 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
     const cursors = new Map<string, HTMLDivElement>();
     let undoStack: string[] = [];
     let joined = false;
+    let undoWhenSaved = false; // undo was pressed while the newest stroke was still unacknowledged
     let buffer: (() => void)[] = [];
     let raf = 0;
     let drawing: (Drawable & { id: string; sent: number; pointerId: number; timer: ReturnType<typeof setInterval> }) | null = null;
@@ -201,7 +202,14 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
           if (attempt < 2) sendCommit(s, attempt + 1);
           return;
         }
-        if (res.ok) return void pending.delete(s.id);
+        if (res.ok) {
+          pending.delete(s.id);
+          if (undoWhenSaved) {
+            undoWhenSaved = false;
+            apiRef.current.undo();
+          }
+          return;
+        }
         if (res.error === "not_joined" || res.error === "rate_limited") return;
         removeStroke(s.id);
         setNotice(res.error === "board_full" ? "The board is full, the last stroke was removed." : "The last stroke could not be saved.");
@@ -211,7 +219,11 @@ export default function Whiteboard(props: { boardId: string; boardName: string; 
     apiRef.current = {
       undo() {
         const id = undoStack[undoStack.length - 1];
-        if (!joined || !id || pending.has(id)) return;
+        if (!joined || !id) return;
+        if (pending.has(id)) {
+          undoWhenSaved = true; // the server does not know this stroke yet, undo as soon as it is saved
+          return;
+        }
         undoStack.pop();
         setUndoCount(undoStack.length);
         socket.timeout(5000).emit("stroke:undo", { id }, (err, res) => {
