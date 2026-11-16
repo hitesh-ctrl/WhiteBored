@@ -1,19 +1,13 @@
+# every dot-file and dot-folder (git data, env files, local tooling, CI) and all markdown files
+.*
+*.md
 node_modules
-.next
-.git
-.env
-.env.*
-!.env.example
 logs
-.claude
-CLAUDE.md
 test-results
 tests
 e2e
 bench
 security
 docs
-*.md
 Dockerfile
 docker-compose.yml
-.github
