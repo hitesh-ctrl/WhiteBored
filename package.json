@@ -34,6 +34,7 @@
     "react-dom": "19.3.1",
     "socket.io": "4.8.4",
     "socket.io-client": "4.8.4",
+    "tsx": "4.23.15",
     "zod": "4.6.7"
   },
   "devDependencies": {
@@ -49,7 +50,6 @@
     "postcss": "8.5.33",
     "prisma": "7.10.1",
     "tailwindcss": "4.3.5",
-    "tsx": "4.23.15",
     "typescript": "5.9.3",
     "vitest": "5.1.0"
   }
