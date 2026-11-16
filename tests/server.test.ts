@@ -185,6 +185,18 @@ describe("commit", () => {
     expect(row?.authorId).toBe(a.clientId);
   });
 
+  it("a stroke id raced from two boards is stored once and never causes an internal error", async () => {
+    for (let round = 0; round < 15; round++) {
+      const b1 = await createBoard(srv.prisma), b2 = await createBoard(srv.prisma);
+      const a = await joinAs(srv, b1.id, "Ann"), b = await joinAs(srv, b2.id, "Bob");
+      const s = stroke();
+      const acks = await Promise.all([emitAck(a.socket, "stroke:commit", s), emitAck(b.socket, "stroke:commit", s)]);
+      expect(acks.filter((x) => x.ok)).toHaveLength(1);
+      expect(acks.filter((x) => !x.ok && x.error === "forbidden")).toHaveLength(1);
+      expect(await srv.prisma.stroke.count({ where: { id: s.id } })).toBe(1);
+    }
+  });
+
   it("stores the points as sent and counts them", async () => {
     const board = await createBoard(srv.prisma);
     const a = await joinAs(srv, board.id, "Ann");
