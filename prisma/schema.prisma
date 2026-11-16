@@ -16,6 +16,7 @@ model Board {
   ownerHash String?
   createdAt DateTime @default(now())
   strokes   Stroke[]
+  images    BoardImage[]
 }
 
 model Stroke {
@@ -35,6 +36,28 @@ model Stroke {
   points     Json
   pointCount Int
   createdAt  DateTime @default(now())
+
+  @@index([boardId, seq])
+}
+
+/// A picture to trace on a board: a built-in outline (template) or an uploaded image (data).
+model BoardImage {
+  seq         Int      @unique @default(autoincrement())
+  id          String   @id @db.Uuid
+  boardId     String   @db.Uuid
+  board       Board    @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  authorId    String   @db.Uuid
+  authorProof String?
+  template    String?
+  mime        String?
+  data        Bytes?
+  byteSize    Int      @default(0)
+  x           Float
+  y           Float
+  w           Float
+  h           Float
+  opacity     Int
+  createdAt   DateTime @default(now())
 
   @@index([boardId, seq])
 }

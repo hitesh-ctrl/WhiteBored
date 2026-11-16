@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { TEMPLATE_KEYS } from "./templates";
 import {
   CANVAS_HEIGHT, CANVAS_WIDTH, MAX_NAME_LENGTH, MAX_POINTS_PER_BATCH, MAX_POINTS_PER_STROKE,
   MAX_MOVE_STROKES, MAX_TEXT_LENGTH, MAX_WIDTH, MIN_WIDTH,
@@ -78,6 +79,25 @@ export const joinSchema = z
   })
   .refine((v) => (v.boardId === undefined) !== (v.viewId === undefined), "give exactly one of boardId and viewId");
 export const renameSchema = z.object({ name: nameSchema });
+
+/* ---------- pictures to trace ---------- */
+const imageGeometry = {
+  x: z.number().min(-800).max(2400),
+  y: z.number().min(-450).max(1350),
+  w: z.number().min(20).max(3200),
+  h: z.number().min(20).max(3200),
+  opacity: z.number().int().min(5).max(100),
+};
+const templateSchema = z.enum(TEMPLATE_KEYS);
+const imageMimeSchema = z.enum(["image/jpeg", "image/png", "image/webp"]);
+export const imageAddSchema = z
+  .object({ id: idSchema, ...imageGeometry, template: templateSchema.optional(), data: z.instanceof(Uint8Array).optional() })
+  .refine((v) => (v.template === undefined) !== (v.data === undefined), "give exactly one of template and data");
+export const imageUpdateSchema = z.object({ id: idSchema, ...imageGeometry });
+export const imageRemoveSchema = z.object({ id: idSchema });
+/** What everybody is told about a picture: never its bytes. */
+export const imageMetaSchema = z.object({ id: idSchema, authorId: idSchema, ...imageGeometry, template: templateSchema.optional(), mime: imageMimeSchema.optional() });
+export const imageRemovedSchema = z.object({ id: idSchema });
 export const moveSchema = z
   .object({
     moves: z.array(z.object({ id: idSchema, newId: idSchema })).min(1).max(MAX_MOVE_STROKES),
@@ -118,11 +138,16 @@ export type ErrorCode =
 export type Ack = { ok: true } | { ok: false; error: ErrorCode };
 export type MoveInput = z.input<typeof moveSchema>;
 export type MoveAck = { ok: true; strokes: Stroke[] } | { ok: false; error: ErrorCode };
+export type ImageMeta = z.infer<typeof imageMetaSchema>;
+export type ImageAddInput = z.input<typeof imageAddSchema>;
+export type ImageUpdateInput = z.input<typeof imageUpdateSchema>;
+export type ImageAck = { ok: true; image: ImageMeta } | { ok: false; error: ErrorCode };
 export type Role = "owner" | "editor" | "viewer";
 export type JoinAck =
   | {
       ok: true;
       strokes: Stroke[];
+      images: ImageMeta[];
       users: User[];
       role: Role;
       canClear: boolean;
@@ -139,6 +164,9 @@ export interface ClientToServerEvents {
   "stroke:commit": (p: StrokeInput, ack: (r: Ack) => void) => void;
   "stroke:undo": (p: { id: string }, ack: (r: Ack) => void) => void;
   "stroke:move": (p: MoveInput, ack: (r: MoveAck) => void) => void;
+  "image:add": (p: ImageAddInput, ack: (r: ImageAck) => void) => void;
+  "image:update": (p: ImageUpdateInput, ack: (r: ImageAck) => void) => void;
+  "image:remove": (p: { id: string }, ack: (r: Ack) => void) => void;
   "board:clear": (ack: (r: Ack) => void) => void;
   "cursor:move": (p: { x: number; y: number }) => void;
   "laser:move": (p: { x: number; y: number }) => void;
@@ -151,6 +179,9 @@ export interface ServerToClientEvents {
   "stroke:commit": (p: Stroke) => void;
   "stroke:remove": (p: { id: string }) => void;
   "stroke:moved": (p: { removed: string[]; added: Stroke[] }) => void;
+  "image:added": (p: ImageMeta) => void;
+  "image:updated": (p: ImageMeta) => void;
+  "image:removed": (p: { id: string }) => void;
   "board:cleared": () => void;
   "user:joined": (p: User) => void;
   "user:left": (p: { id: string }) => void;

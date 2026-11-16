@@ -7,10 +7,15 @@ export const MAX_POINTS_PER_BOARD = 500_000;
 export const MIN_WIDTH = 1;
 export const MAX_WIDTH = 40;
 export const MAX_NAME_LENGTH = 30;
-export const MAX_MESSAGE_BYTES = 256 * 1024;
+export const MAX_MESSAGE_BYTES = 512 * 1024;
 export const MAX_TEXT_LENGTH = 200;
 export const MAX_MOVE_STROKES = 100;
 export const MAX_CONNECTIONS_PER_IP = 30;
 export const BOARD_CREATES_PER_MINUTE = 5;
 /** Font size in canvas units for a text stroke, derived from its width setting. */
 export const fontSizeFor = (width: number) => 8 + 2 * width;
+export const MAX_IMAGES_PER_BOARD = 8;
+export const MAX_IMAGE_BYTES = 400 * 1024;
+export const MAX_IMAGE_BYTES_PER_BOARD = 2_500_000;
+export const MAX_IMAGE_SIDE = 4096;
+export const MAX_IMAGE_PIXELS = 8_000_000;

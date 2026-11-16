@@ -1,15 +1,18 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { clientAddress, trustHops } from "../lib/proxy";
+import { checkImage } from "../shared/images";
 import { clampDelta, pointsBounds, translatePoints } from "../shared/move";
 import { Server, type Socket } from "socket.io";
 import type { PrismaClient } from "../generated/prisma/client";
 import {
-  MAX_CONNECTIONS_PER_IP, MAX_MESSAGE_BYTES, MAX_POINTS_PER_BOARD, MAX_STROKES_PER_BOARD,
+  MAX_CONNECTIONS_PER_IP, MAX_IMAGES_PER_BOARD, MAX_IMAGE_BYTES_PER_BOARD, MAX_MESSAGE_BYTES, MAX_POINTS_PER_BOARD,
+  MAX_STROKES_PER_BOARD,
 } from "../shared/limits";
 import {
-  commitSchema, cursorSchema, joinSchema, moveSchema, progressSchema, renameSchema, roomOf, undoSchema,
-  type ClientToServerEvents, type ErrorCode, type JoinAck, type Role, type ServerToClientEvents,
+  commitSchema, cursorSchema, imageAddSchema, imageRemoveSchema, imageUpdateSchema, joinSchema, moveSchema, progressSchema,
+  renameSchema, roomOf, undoSchema,
+  type ClientToServerEvents, type ErrorCode, type ImageMeta, type JoinAck, type Role, type ServerToClientEvents,
   type Point, type SocketData, type Stroke, type User,
 } from "../shared/protocol";
 import { createBuckets, type LimitKind } from "./rateLimit";
@@ -37,6 +40,18 @@ export interface WhiteboardServerOptions {
 }
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest();
+
+type ImageRow = {
+  id: string; authorId: string; template: string | null; mime: string | null;
+  x: number; y: number; w: number; h: number; opacity: number;
+};
+const toImageMeta = (r: ImageRow): ImageMeta => ({
+  id: r.id, authorId: r.authorId,
+  ...(r.template ? { template: r.template as ImageMeta["template"] } : {}),
+  ...(r.mime ? { mime: r.mime as ImageMeta["mime"] } : {}),
+  x: r.x, y: r.y, w: r.w, h: r.h, opacity: r.opacity,
+});
+const IMAGE_COLUMNS = { id: true, authorId: true, template: true, mime: true, x: true, y: true, w: true, h: true, opacity: true } as const;
 
 type StrokeRow = { id: string; authorId: string; color: string; width: number; kind: string; points: unknown; text: string | null; containerId?: string | null };
 const toStroke = (r: StrokeRow): Stroke => ({
@@ -227,9 +242,10 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
 
         // Join the room before reading history so no live event can fall between the two.
         await socket.join(room);
-        let rows;
+        let rows, imageRows;
         try {
           rows = await prisma.stroke.findMany({ where: { boardId }, orderBy: { seq: "asc" } });
+          imageRows = await prisma.boardImage.findMany({ where: { boardId }, orderBy: { seq: "asc" }, select: IMAGE_COLUMNS }); // metadata only, never the bytes
         } catch (err) {
           await socket.leave(room);
           throw err;
@@ -269,7 +285,7 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
 
         const strokes: Stroke[] = rows.map(toStroke);
         const reply: JoinAck = {
-          ok: true, strokes, users: usersOf(boardId), role, canClear, boardName: board.name,
+          ok: true, strokes, images: imageRows.map(toImageMeta), users: usersOf(boardId), role, canClear, boardName: board.name,
           ...(role === "viewer" ? {} : { viewId: board.viewId }),
         };
         ack?.(reply as never);
@@ -406,6 +422,89 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
         if (result.kind === "forbidden") return fail(ack, "forbidden");
         if (result.kind === "moved") socket.to(c.room).emit("stroke:moved", { removed: oldIds, added: result.added });
         ack?.({ ok: true, strokes: result.added } as never);
+      });
+    });
+
+    on("image:add", "image", async (raw, ack) => {
+      const c = ctx();
+      if (!c) return fail(ack, "not_joined");
+      if (c.role === "viewer") return fail(ack, "forbidden");
+      const parsed = imageAddSchema.safeParse(raw);
+      if (!parsed.success) return fail(ack, "invalid");
+      const v = parsed.data;
+      // an upload is checked by looking at the bytes themselves: type, size and the picture's own dimensions
+      let upload: { mime: string; bytes: Buffer } | null = null;
+      if (v.data) {
+        const checked = checkImage(v.data);
+        if (!checked.ok) return fail(ack, "invalid");
+        upload = { mime: checked.mime, bytes: Buffer.from(v.data) };
+      }
+
+      await inBoardOrder(c.boardId, async () => {
+        const result = await prisma.$transaction(async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${c.boardId}, 0))`;
+          const existing = await tx.boardImage.findUnique({ where: { id: v.id }, select: { ...IMAGE_COLUMNS, boardId: true, authorProof: true } });
+          if (existing) {
+            const same = existing.boardId === c.boardId && existing.authorId === c.clientId && (existing.authorProof === null || existing.authorProof === c.proof);
+            return same ? { kind: "again" as const, row: existing } : { kind: "forbidden" as const };
+          }
+          if ((await tx.boardImage.count({ where: { boardId: c.boardId } })) >= MAX_IMAGES_PER_BOARD) return { kind: "full" as const };
+          if (upload) {
+            const used = await tx.boardImage.aggregate({ where: { boardId: c.boardId }, _sum: { byteSize: true } });
+            if ((used._sum.byteSize ?? 0) + upload.bytes.length > MAX_IMAGE_BYTES_PER_BOARD) return { kind: "full" as const };
+          }
+          const row = await tx.boardImage.create({
+            data: {
+              id: v.id, boardId: c.boardId, authorId: c.clientId, authorProof: c.proof,
+              template: v.template ?? null, mime: upload?.mime ?? null, data: upload ? new Uint8Array(upload.bytes) : null, byteSize: upload?.bytes.length ?? 0,
+              x: v.x, y: v.y, w: v.w, h: v.h, opacity: v.opacity,
+            },
+            select: IMAGE_COLUMNS,
+          });
+          return { kind: "created" as const, row };
+        });
+        if (result.kind === "forbidden") return fail(ack, "forbidden");
+        if (result.kind === "full") return fail(ack, "board_full");
+        const image = toImageMeta(result.row);
+        if (result.kind === "created") socket.to(c.room).emit("image:added", image);
+        ack?.({ ok: true, image } as never);
+      });
+    });
+
+    /** Whoever added a picture may change it (with the same key, as for strokes), and so may the board owner. */
+    const mayChangeImage = (row: { authorId: string; authorProof: string | null }, c: NonNullable<ReturnType<typeof ctx>>) =>
+      c.role === "owner" || (row.authorId === c.clientId && (row.authorProof === null || row.authorProof === c.proof));
+
+    on("image:update", "mutate", async (raw, ack) => {
+      const c = ctx();
+      if (!c) return fail(ack, "not_joined");
+      if (c.role === "viewer") return fail(ack, "forbidden");
+      const parsed = imageUpdateSchema.safeParse(raw);
+      if (!parsed.success) return fail(ack, "invalid");
+      const { id, x, y, w, h, opacity } = parsed.data;
+      await inBoardOrder(c.boardId, async () => {
+        const row = await prisma.boardImage.findFirst({ where: { id, boardId: c.boardId }, select: { authorId: true, authorProof: true } });
+        if (!row || !mayChangeImage(row, c)) return fail(ack, "forbidden");
+        const updated = await prisma.boardImage.update({ where: { id }, data: { x, y, w, h, opacity }, select: IMAGE_COLUMNS });
+        const image = toImageMeta(updated);
+        socket.to(c.room).emit("image:updated", image);
+        ack?.({ ok: true, image } as never);
+      });
+    });
+
+    on("image:remove", "mutate", async (raw, ack) => {
+      const c = ctx();
+      if (!c) return fail(ack, "not_joined");
+      if (c.role === "viewer") return fail(ack, "forbidden");
+      const parsed = imageRemoveSchema.safeParse(raw);
+      if (!parsed.success) return fail(ack, "invalid");
+      const { id } = parsed.data;
+      await inBoardOrder(c.boardId, async () => {
+        const row = await prisma.boardImage.findFirst({ where: { id, boardId: c.boardId }, select: { authorId: true, authorProof: true } });
+        if (!row || !mayChangeImage(row, c)) return fail(ack, "forbidden");
+        await prisma.boardImage.delete({ where: { id } });
+        socket.to(c.room).emit("image:removed", { id });
+        done(ack);
       });
     });
 

@@ -424,6 +424,144 @@ await check("keyboard shortcuts work right after clicking a tool button (Space, 
   await waitUntil(async () => (await rows2()).length === 0, 4000, "Ctrl+Z after clicking a button");
 });
 
+/* ---------- pictures to trace: a fresh board ---------- */
+const { p: E } = await mk();
+const { p: F } = await mk(1000, 700);
+const { p: G } = await mk(1000, 700);
+E.on("dialog", (d) => void d.accept());
+for (const [n, pg] of [["E", E], ["F", F], ["G", G]] as const) pg.on("pageerror", (e) => errors.push(`${n}: ${e.message}`));
+await E.goto(WEB);
+await E.fill("#name", "Pictures");
+await E.click("text=Create board");
+await E.waitForURL(/\/board\/[0-9a-f-]{36}/);
+const board3Url = E.url().split("#")[0];
+const board3 = board3Url.split("/").pop()!;
+await enterName(E, "Eve");
+await F.goto(board3Url); await enterName(F, "Fay");
+const ebox = (await E.locator("canvas").boundingBox())!;
+const eat = (cx: number, cy: number) => [ebox.x + (cx / 1600) * ebox.width, ebox.y + (cy / 900) * ebox.height] as const;
+const pixel = (page: Page, x: number, y: number) => page.evaluate(`Array.from(document.querySelector("canvas").getContext("2d").getImageData(${x},${y},1,1).data)`) as Promise<number[]>;
+const images3 = () => prisma.boardImage.findMany({ where: { boardId: board3 }, orderBy: { seq: "asc" } });
+const addTemplate = async (page: Page, label: string) => { await page.getByRole("button", { name: "Add picture" }).click(); await page.getByRole("group", { name: "Add a picture to trace" }).getByRole("button", { name: label, exact: true }).click(); };
+let heartId = "", uploadId = "";
+
+await check("a built-in outline is added, shown to everyone at the same place, and the confirmation is on screen", async () => {
+  await addTemplate(E, "Heart");
+  await waitUntil(async () => (await images3()).length === 1, 5000, "row stored");
+  const row = (await images3())[0];
+  heartId = row.id;
+  if (row.template !== "heart" || row.data !== null) throw new Error(JSON.stringify({ t: row.template, d: row.data }));
+  await waitUntil(async () => (await pixel(E, 800, 702))[3] > 0 && (await pixel(F, 800, 702))[3] > 0, 5000, "outline visible in both");
+  const toast = E.locator("[aria-live=polite] span");
+  const tb = await toast.boundingBox();
+  if (!tb || tb.y + tb.height > 800) throw new Error("the message is not inside the window");
+  await shot(E, "f11-picture-heart");
+  return "heart outline at its centred place for both";
+});
+await check("tracing: pen strokes go on top and never move the picture", async () => {
+  await pick(E, "Pen");
+  const inkF0 = await ink(F);
+  await stroke(E, [0.5, 0.35], [0.7, 0.5]);
+  await waitUntil(async () => (await ink(F)) > inkF0 + 100, 5000, "stroke in F"); // not compared with E: E also draws the selection outline
+  const row = (await images3())[0];
+  if (row.x !== 485 || row.y !== 135) throw new Error(`the picture moved to ${row.x},${row.y}`);
+  if (!((await pixel(E, 800, 702))[3] > 0)) throw new Error("the outline disappeared");
+  await C.waitForTimeout(1);
+});
+await check("Hand tool: the picture's author drags it to a new place for everyone, and the other editor cannot", async () => {
+  await pick(F, "Hand");
+  const fbox = (await F.locator("canvas").boundingBox())!;
+  await F.mouse.move(fbox.x + (600 / 1600) * fbox.width, fbox.y + (300 / 900) * fbox.height);
+  await F.mouse.down(); await F.mouse.move(fbox.x + (700 / 1600) * fbox.width, fbox.y + (340 / 900) * fbox.height, { steps: 5 }); await F.mouse.up();
+  await sleep(600);
+  let row = (await images3())[0];
+  if (row.x !== 485 || row.y !== 135) throw new Error("another editor moved it");
+  await pick(E, "Hand");
+  const [sx, sy] = eat(600, 300);
+  await E.mouse.move(sx, sy); await E.mouse.down(); await E.mouse.move(sx + 60, sy + 20, { steps: 4 }); await E.mouse.move(sx + 120, sy + 40, { steps: 4 }); await E.mouse.up();
+  const dx = Math.round((120 / ebox.width) * 1600), dy = Math.round((40 / ebox.height) * 900);
+  await waitUntil(async () => { row = (await images3())[0]; return Math.abs(row.x - (485 + dx)) < 3; }, 5000, "stored at the new place");
+  await waitUntil(async () => (await pixel(F, 800 + dx, 702 + dy))[3] > 0 && (await pixel(F, 800, 702))[3] === 0, 5000, "moved for F");
+  await shot(F, "f12-picture-moved");
+  return `moved by about ${dx},${dy} board units`;
+});
+await check("resize from the corner square keeps the shape, and the opacity slider fades it for everyone", async () => {
+  let row = (await images3())[0];
+  const [hx, hy] = eat(row.x + row.w, row.y + row.h);
+  await E.mouse.move(hx, hy); await E.mouse.down(); await E.mouse.move(hx + 40, hy + 30, { steps: 5 }); await E.mouse.move(hx + 80, hy + 60, { steps: 5 }); await E.mouse.up();
+  const grow = (80 / ebox.width) * 1600;
+  await waitUntil(async () => { row = (await images3())[0]; return Math.abs(row.w - (630 + grow)) < 4 && Math.abs(row.w - row.h) < 1; }, 5000, "resized, still square");
+  const slider = E.getByLabel("Picture opacity");
+  await slider.evaluate((el, v) => {
+    // set the value the way a user's input does, so React notices the change
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(el, v);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  }, "20");
+  await waitUntil(async () => (await images3())[0].opacity === 20, 5000, "opacity stored");
+  return `width ${Math.round(row.w)}, opacity 20`;
+});
+await check("a real upload: shrunk in the browser, stored as a small JPEG, shown to the other person, and served with safe headers", async () => {
+  await E.keyboard.press("Delete"); // remove the heart
+  await waitUntil(async () => (await images3()).length === 0, 5000, "heart removed");
+  const b64 = (await E.evaluate(`(() => { const c = document.createElement("canvas"); c.width = 3000; c.height = 2250; const g = c.getContext("2d"); g.fillStyle = "#ffffff"; g.fillRect(0, 0, 3000, 2250); g.fillStyle = "#2563eb"; g.beginPath(); g.arc(1500, 1125, 700, 0, 7); g.fill(); return c.toDataURL("image/png").split(",")[1]; })()`)) as string;
+  await F.getByRole("button", { name: "Add picture" }).click();
+  await F.locator("input[type=file]").setInputFiles({ name: "circle.png", mimeType: "image/png", buffer: Buffer.from(b64, "base64") });
+  await waitUntil(async () => (await images3()).length === 1, 8000, "upload stored");
+  const row = (await images3())[0];
+  uploadId = row.id;
+  if (row.mime !== "image/jpeg" || !row.data || row.byteSize > 400 * 1024 || row.byteSize !== row.data.length) throw new Error(JSON.stringify({ mime: row.mime, size: row.byteSize }));
+  await waitUntil(async () => { const px = await pixel(E, 800, 450); return px[2] > 150 && px[0] < 120 && px[3] > 0; }, 8000, "blue circle visible to Eve");
+  const res = await fetch(`${WEB}/images/${uploadId}`);
+  const body = Buffer.from(await res.arrayBuffer());
+  const got = { status: res.status, type: res.headers.get("content-type"), nosniff: res.headers.get("x-content-type-options"), csp: res.headers.get("content-security-policy"), first: [body[0], body[1]] };
+  if (got.status !== 200 || got.type !== "image/jpeg" || got.nosniff !== "nosniff" || !(got.csp ?? "").includes("sandbox") || got.first[0] !== 0xff || got.first[1] !== 0xd8) throw new Error(`bad response ${JSON.stringify(got)}`);
+  for (const bad of [`${WEB}/images/${crypto.randomUUID()}`, `${WEB}/images/${heartId}`, `${WEB}/images/not-a-uuid`]) if ((await fetch(bad)).status !== 404) throw new Error(`${bad} should be 404`);
+  await shot(E, "f13-picture-upload");
+  return `3000x2250 png became a ${Math.round(row.byteSize / 1024)} KB jpeg`;
+});
+await check("the board owner can move and remove a picture somebody else added, and a viewer can see it but not add", async () => {
+  await pick(E, "Hand");
+  const [sx, sy] = eat(500, 300);
+  const before = (await images3())[0];
+  await E.mouse.move(sx, sy); await E.mouse.down(); await E.mouse.move(sx + 50, sy + 30, { steps: 5 }); await E.mouse.up();
+  await waitUntil(async () => (await images3())[0].x !== before.x, 5000, "owner moved Fay's picture");
+  const viewId = (await prisma.board.findUniqueOrThrow({ where: { id: board3 } })).viewId;
+  await G.goto(`${WEB}/view/${viewId}`); await enterName(G, "Gus");
+  await waitUntil(async () => (await pixel(G, 800 + 60, 450 + 30))[3] > 0, 8000, "viewer sees the picture");
+  if ((await G.getByRole("button", { name: "Add picture" }).count()) !== 0) throw new Error("viewer can add pictures");
+  await E.keyboard.press("Delete");
+  await waitUntil(async () => (await images3()).length === 0, 5000, "owner removed it");
+  await waitUntil(async () => (await pixel(F, 800, 450))[3] === 0, 5000, "gone for Fay");
+});
+await check("files that are not JPEG, PNG or WebP are refused with a message, and clearing the board keeps pictures", async () => {
+  await F.getByRole("button", { name: "Add picture" }).click();
+  await F.locator("input[type=file]").setInputFiles({ name: "evil.svg", mimeType: "image/svg+xml", buffer: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>') });
+  await F.getByText("Choose a JPEG, PNG or WebP picture.").waitFor({ timeout: 4000 });
+  await F.getByRole("button", { name: "Add picture" }).click();
+  await F.locator("input[type=file]").setInputFiles({ name: "x.gif", mimeType: "image/gif", buffer: Buffer.from("GIF89a\x01\x00\x01\x00") });
+  await F.getByText("Choose a JPEG, PNG or WebP picture.").waitFor({ timeout: 4000 });
+  if ((await images3()).length !== 0) throw new Error("a refused file was stored");
+  await addTemplate(E, "Star");
+  await waitUntil(async () => (await images3()).length === 1, 5000, "star added");
+  await stroke(E, [0.1, 0.9], [0.3, 0.9]);
+  await E.getByRole("button", { name: "Clear board" }).click();
+  await waitUntil(async () => (await prisma.stroke.count({ where: { boardId: board3 } })) === 0, 5000, "strokes cleared");
+  if ((await images3()).length !== 1) throw new Error("clearing removed the picture");
+});
+await check("exports include the pictures: the SVG carries outlines and embedded uploads, and a late joiner sees them", async () => {
+  await F.getByRole("button", { name: "Add picture" }).click();
+  const b64 = (await F.evaluate(`(() => { const c = document.createElement("canvas"); c.width = 400; c.height = 300; const g = c.getContext("2d"); g.fillStyle = "#dc2626"; g.fillRect(0, 0, 400, 300); return c.toDataURL("image/png").split(",")[1]; })()`)) as string;
+  await F.locator("input[type=file]").setInputFiles({ name: "red.png", mimeType: "image/png", buffer: Buffer.from(b64, "base64") });
+  await waitUntil(async () => (await images3()).length === 2, 8000, "second picture");
+  const [svgDl] = await Promise.all([E.waitForEvent("download"), E.getByRole("button", { name: "Export SVG" }).click()]);
+  const svg = readFileSync((await svgDl.path())!, "utf8");
+  if (!/<g transform="translate\([^"]*scale\([^"]*\)" opacity="0\.6"/.test(svg) || !/<image [^>]*href="data:image\/jpeg;base64,[A-Za-z0-9+/=]+"/.test(svg)) throw new Error("the SVG is missing the pictures");
+  const { p: H } = await mk();
+  await H.goto(board3Url); await enterName(H, "Hal");
+  await waitUntil(async () => (await pixel(H, 800, 450))[3] > 0, 8000, "late joiner sees the uploaded picture");
+  return `svg ${Math.round(svg.length / 1024)} KB`;
+});
+
 await check("metrics are served and have counted this session", async () => {
   const text = await (await fetch(`${SOCKET}/metrics`)).text();
   const num = (n: string) => Number(new RegExp(`^${n} (\\d+)$`, "m").exec(text)?.[1] ?? NaN);
@@ -436,7 +574,7 @@ await check("no uncaught page errors and no CSP violations", async () => {
 
 await browser.close();
 socket.kill("SIGTERM"); web.kill("SIGTERM");
-await prisma.board.deleteMany({ where: { id: { in: [boardId, board2] } } });
+await prisma.board.deleteMany({ where: { id: { in: [boardId, board2, board3] } } });
 await prisma.$disconnect();
 writeFileSync("logs/evidence/e2e-features-results.json", JSON.stringify(results, null, 2));
 const failed = results.filter((r) => !r.pass).length;

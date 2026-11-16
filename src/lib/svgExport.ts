@@ -1,6 +1,7 @@
 import { CANVAS_HEIGHT, CANVAS_WIDTH, fontSizeFor } from "../shared/limits";
 import type { Point } from "./drawing";
 import { renderOrder } from "./render";
+import { TEMPLATES } from "../shared/templates";
 
 export type ExportStroke = { id?: string; authorId?: string; kind: string; color: string; width: number; points: Point[]; text?: string | null };
 
@@ -44,11 +45,30 @@ function element(s: ExportStroke): string {
   }
 }
 
+/** A picture under the drawing: an uploaded one as a data address, or a built-in outline by key. */
+export type ExportImage = { x: number; y: number; w: number; h: number; opacity: number; href?: string; template?: string };
+
+const DATA_PICTURE = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
+
+function pictureElement(p: ExportImage): string {
+  if (![p.x, p.y, p.w, p.h, p.opacity].every(Number.isFinite)) return "";
+  const opacity = Math.min(100, Math.max(5, Math.round(p.opacity))) / 100;
+  if (p.href !== undefined) {
+    if (!DATA_PICTURE.test(p.href)) return "";
+    return `<image x="${n(p.x)}" y="${n(p.y)}" width="${n(p.w)}" height="${n(p.h)}" opacity="${opacity}" href="${p.href}" preserveAspectRatio="none"/>`;
+  }
+  const template = TEMPLATES.find((t) => t.key === p.template);
+  if (!template) return "";
+  const thin = n((2.5 * 100) / Math.max(1, Math.min(p.w, p.h)));
+  return `<g transform="translate(${n(p.x)} ${n(p.y)}) scale(${n(p.w / 100)} ${n(p.h / 100)})" opacity="${opacity}" fill="none" stroke="#475569" stroke-width="${thin}" stroke-linecap="round" stroke-linejoin="round"><path d="${template.path}"/></g>`;
+}
+
 /** The whole board as a standalone SVG file. Only validated values are written into attributes. */
-export function strokesToSvg(strokes: ExportStroke[]): string {
+export function strokesToSvg(strokes: ExportStroke[], images: ExportImage[] = []): string {
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" width="${CANVAS_WIDTH}" height="${CANVAS_HEIGHT}" viewBox="0 0 ${CANVAS_WIDTH} ${CANVAS_HEIGHT}">` +
     `<rect width="${CANVAS_WIDTH}" height="${CANVAS_HEIGHT}" fill="#ffffff"/>` +
+    images.map(pictureElement).join("") +
     renderOrder(strokes).map(element).join("") +
     `</svg>`
   );

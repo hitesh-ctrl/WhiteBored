@@ -20,7 +20,7 @@ export class TokenBucket {
   }
 }
 
-export type LimitKind = "join" | "progress" | "commit" | "undo" | "mutate" | "cursor";
+export type LimitKind = "join" | "progress" | "commit" | "undo" | "mutate" | "cursor" | "image";
 
 /** Per-socket limits, see docs/DESIGN.md section 3. `mutate` covers undo and clear. */
 export const RATE_LIMITS: Record<LimitKind, { ratePerSec: number; burst: number }> = {
@@ -30,10 +30,11 @@ export const RATE_LIMITS: Record<LimitKind, { ratePerSec: number; burst: number 
   // the eraser removes many strokes in one sweep, so undo gets more room than clear and rename
   undo: { ratePerSec: 30, burst: 60 },
   mutate: { ratePerSec: 5, burst: 10 },
+  image: { ratePerSec: 0.2, burst: 5 }, // adding a picture: a burst of 5, then one every 5 seconds
   cursor: { ratePerSec: 60, burst: 30 },
 };
 
 export function createBuckets(now?: () => number): Record<LimitKind, TokenBucket> {
   const mk = (k: LimitKind) => new TokenBucket(RATE_LIMITS[k].ratePerSec, RATE_LIMITS[k].burst, now);
-  return { join: mk("join"), progress: mk("progress"), commit: mk("commit"), undo: mk("undo"), mutate: mk("mutate"), cursor: mk("cursor") };
+  return { join: mk("join"), progress: mk("progress"), commit: mk("commit"), undo: mk("undo"), mutate: mk("mutate"), image: mk("image"), cursor: mk("cursor") };
 }

@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
 import { copyText } from "../lib/clipboard";
+import { UploadError, prepareUpload } from "../lib/imageUpload";
+import { clampImageRect, fitRect, onHandle, rectContains, resizeKeepAspect, type Rect } from "../lib/imageLayer";
 import { colorFor } from "../lib/color";
 import { nextBatch, ownStrokeIds, shouldAddPoint, toCanvasPoint } from "../lib/drawing";
 import { findFillContainer } from "../lib/fill";
@@ -12,23 +14,24 @@ import { newId } from "../lib/ids";
 import { RECENT_KEY, parseRecent, upsertRecent } from "../lib/recent";
 import { expandSelection, normalizeRect, selectionBounds, strokesInRect } from "../lib/selection";
 import { drawStroke, renderOrder, safeFileName, type Drawable } from "../lib/render";
-import { strokesToSvg } from "../lib/svgExport";
+import { strokesToSvg, type ExportImage } from "../lib/svgExport";
 import { socketBase } from "../lib/socketUrl";
 import { throttle } from "../lib/throttle";
 import { DEFAULT_VIEW, MAX_ZOOM, clampView, wheelAction, zoomAt, type View } from "../lib/viewport";
 import { CANVAS_HEIGHT, CANVAS_WIDTH, MAX_POINTS_PER_STROKE, MAX_TEXT_LENGTH, fontSizeFor } from "../shared/limits";
 import { clampDelta, pointsBounds, translatePoints } from "../shared/move";
+import { TEMPLATES, type TemplateKey } from "../shared/templates";
 import {
-  BAD_TEXT_CHARS, authoredProgressSchema, authoredStrokeSchema, movedSchema, remoteCursorSchema, removeSchema, renamedSchema,
+  BAD_TEXT_CHARS, authoredProgressSchema, authoredStrokeSchema, imageMetaSchema, imageRemovedSchema, movedSchema, remoteCursorSchema, removeSchema, renamedSchema,
   userLeftSchema, userSchema,
-  type ClientToServerEvents, type Kind, type MoveAck, type MoveInput, type Point, type Role, type ServerToClientEvents, type Stroke,
+  type ClientToServerEvents, type ImageAddInput, type ImageMeta, type Kind, type MoveAck, type MoveInput, type Point, type Role, type ServerToClientEvents, type Stroke,
   type StrokeInput, type User,
 } from "../shared/protocol";
 
 const SOCKET_URL = socketBase(process.env.NEXT_PUBLIC_SOCKET_URL); // undefined: the page's own address
 const COLORS = [
   ["Black", "#111827"], ["Red", "#dc2626"], ["Orange", "#ea580c"], ["Yellow", "#ca8a04"],
-  ["Green", "#16a34a"], ["Blue", "#2563eb"], ["Purple", "#7c3aed"], ["Pink", "#db2777"],
+  ["Green", "#16a34a"], ["Blue", "#2563eb"], ["Purple", "#7c3aed"], ["Pink", "#db2777"], ["White", "#ffffff"],
 ] as const;
 const TOOLS = [
   ["pen", "Pen"], ["eraser", "Eraser"], ["fill", "Fill"], ["line", "Line"], ["arrow", "Arrow"], ["rect", "Rectangle"],
@@ -50,9 +53,13 @@ type Api = {
   rename(name: string): void;
   commitText(x: number, y: number, text: string): void;
   deleteSelection(): void;
+  addTemplate(key: TemplateKey): void;
+  uploadPicture(file: File): void;
+  setPictureOpacity(value: number): void;
+  removePicture(): void;
 };
 const noApi: Api = {
-  undo() {}, redo() {}, clear() {}, zoomBy() {}, resetView() {}, exportPng() {}, exportSvg() {}, rename() {}, commitText() {}, deleteSelection() {},
+  undo() {}, redo() {}, clear() {}, zoomBy() {}, resetView() {}, exportPng() {}, exportSvg() {}, rename() {}, commitText() {}, deleteSelection() {}, addTemplate() {}, uploadPicture() {}, setPictureOpacity() {}, removePicture() {},
 };
 
 type Props = { boardId?: string; viewId?: string; boardName: string; name: string; clientId: string; clientKey: string; ownerKey?: string };
@@ -87,6 +94,9 @@ export default function Whiteboard(props: Props) {
   const [panningUi, setPanningUi] = useState(false);
   const [copied, setCopied] = useState<"edit" | "view" | null>(null);
   const [selCount, setSelCount] = useState(0);
+  const [selPicture, setSelPicture] = useState<ImageMeta | null>(null);
+  const [pictureMenu, setPictureMenu] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState("");
 
@@ -134,7 +144,15 @@ export default function Whiteboard(props: Props) {
     type MoveGroup = { ids: string[]; origIds: string[]; dx: number; dy: number };
     const selected = new Set<string>();
     const moveGroups = new Map<string, MoveGroup>();
+    /** Pictures to trace sit under the drawing; `el` is the loaded image for an upload (built-in outlines have none). */
+    type PictureItem = { meta: ImageMeta; el: HTMLImageElement | null };
+    const pictures = new Map<string, PictureItem>();
+    const outlinePaths = new Map<string, Path2D>();
+    let selectedPicture: string | null = null;
+    let opacityTimer: ReturnType<typeof setTimeout> | undefined;
+    let opacityBase: ImageMeta | null = null;
     let gesture:
+      | { kind: "picture"; pointerId: number; mode: "move" | "resize"; id: string; start: Point; orig: Rect; moved: boolean }
       | { kind: "move"; pointerId: number; start: Point; ids: string[]; dx: number; dy: number; moved: boolean }
       | { kind: "marquee"; pointerId: number; start: Point; cur: Point; base: string[] }
       | null = null;
@@ -153,6 +171,7 @@ export default function Whiteboard(props: Props) {
         viewTransform(cctx); // stays set, so new strokes can be drawn straight onto the layer
         // strokes being dragged are drawn separately at their new place, so they are left out here
         const hide = gesture?.kind === "move" && gesture.moved ? new Set(gesture.ids) : null;
+        drawPictures(cctx);
         for (const s of renderOrder(hide ? strokes.filter((x) => !hide.has(x.id)) : strokes)) drawStroke(cctx, s);
       }
       ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -176,6 +195,15 @@ export default function Whiteboard(props: Props) {
       if (box) {
         const pad = 4 / curView.zoom;
         ctx.strokeRect(box.x - pad, box.y - pad, box.w + 2 * pad, box.h + 2 * pad);
+      }
+      const pic = selectedPicture ? pictures.get(selectedPicture)?.meta : undefined;
+      if (pic) {
+        const pad = 3 / curView.zoom, s = 10 / curView.zoom;
+        ctx.strokeRect(pic.x - pad, pic.y - pad, pic.w + 2 * pad, pic.h + 2 * pad);
+        ctx.setLineDash([]);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(pic.x + pic.w - s / 2, pic.y + pic.h - s / 2, s, s); // the corner square that resizes it
+        ctx.strokeRect(pic.x + pic.w - s / 2, pic.y + pic.h - s / 2, s, s);
       }
       if (gesture?.kind === "marquee") {
         const r = normalizeRect(gesture.start, gesture.cur);
@@ -338,6 +366,22 @@ export default function Whiteboard(props: Props) {
       for (const s of p.data.added) addStroke(s);
       rebuild();
     }));
+    socket.on("image:added", gate((raw) => {
+      const p = imageMetaSchema.safeParse(raw);
+      if (p.success && !pictures.has(p.data.id)) addPicture(p.data);
+    }));
+    socket.on("image:updated", gate((raw) => {
+      const p = imageMetaSchema.safeParse(raw);
+      const item = p.success ? pictures.get(p.data.id) : undefined;
+      if (!p.success || !item || (gesture?.kind === "picture" && gesture.id === p.data.id)) return; // not while we are dragging it
+      item.meta = p.data;
+      if (selectedPicture === p.data.id) syncPicture();
+      rebuild();
+    }));
+    socket.on("image:removed", gate((raw) => {
+      const p = imageRemovedSchema.safeParse(raw);
+      if (p.success) removePictureLocal(p.data.id);
+    }));
     socket.on("board:cleared", gate(() => clearAll()));
     socket.on("board:renamed", gate((raw) => {
       const p = renamedSchema.safeParse(raw);
@@ -473,6 +517,74 @@ export default function Whiteboard(props: Props) {
       });
     };
 
+    /* ----- pictures to trace ----- */
+    const syncPicture = () => setSelPicture(selectedPicture ? pictures.get(selectedPicture)?.meta ?? null : null);
+    const drawPictures = (g: CanvasRenderingContext2D) => {
+      for (const { meta, el } of pictures.values()) {
+        g.save();
+        g.globalAlpha = meta.opacity / 100;
+        if (meta.template) {
+          const outline = TEMPLATES.find((t) => t.key === meta.template);
+          if (outline) {
+            let path = outlinePaths.get(outline.key);
+            if (!path) outlinePaths.set(outline.key, (path = new Path2D(outline.path)));
+            g.translate(meta.x, meta.y);
+            g.scale(meta.w / 100, meta.h / 100);
+            g.lineWidth = 250 / Math.max(1, Math.min(meta.w, meta.h)); // about 2.5 units on the board, whatever the size
+            g.lineCap = "round";
+            g.lineJoin = "round";
+            g.strokeStyle = "#475569";
+            g.stroke(path);
+          }
+        } else if (el && el.complete && el.naturalWidth > 0) {
+          g.drawImage(el, meta.x, meta.y, meta.w, meta.h);
+        }
+        g.restore();
+      }
+    };
+    const addPicture = (meta: ImageMeta) => {
+      let el: HTMLImageElement | null = null;
+      if (!meta.template) {
+        el = new Image();
+        el.onload = () => rebuild();
+        el.src = `/images/${meta.id}`; // from the page's own address; the id is a checked uuid
+      }
+      pictures.set(meta.id, { meta, el });
+      rebuild();
+    };
+    const removePictureLocal = (id: string) => {
+      pictures.delete(id);
+      if (selectedPicture === id) { selectedPicture = null; syncPicture(); }
+      rebuild();
+    };
+    const sendPicture = (req: ImageAddInput) => {
+      socket.timeout(15000).emit("image:add", req, (err, res) => {
+        if (disposed) return;
+        if (err) return setNotice("The picture could not be sent. Try again.");
+        if (!res.ok) {
+          setNotice(res.error === "board_full" ? "This board has reached its limit of pictures." : res.error === "rate_limited" ? "Adding pictures too fast. Wait a few seconds." : "The picture could not be added.");
+          return;
+        }
+        if (!pictures.has(res.image.id)) addPicture(res.image);
+        selectedPicture = res.image.id;
+        syncPicture();
+        setNotice("Picture added. Use the Hand tool to move it, then trace over it with the Pen.");
+      });
+    };
+    /** Tell the server about a moved, resized or faded picture; if it refuses, show the picture as it was. */
+    const sendPictureUpdate = (now: ImageMeta, before: ImageMeta) => {
+      socket.timeout(5000).emit("image:update", { id: now.id, x: now.x, y: now.y, w: now.w, h: now.h, opacity: now.opacity }, (err, res) => {
+        if (disposed) return;
+        const item = pictures.get(now.id);
+        if (!item) return;
+        if (!err && res.ok) { item.meta = res.image; syncPicture(); rebuild(); return; }
+        item.meta = before;
+        syncPicture();
+        rebuild();
+        setNotice("The picture could not be changed.");
+      });
+    };
+
     /* ----- selecting and moving ----- */
     const isSelectable = (s: Stroke) => s.authorId === clientId && !pending.has(s.id) && !erasing.has(s.id);
     /** The person's own stroke under the pointer: the one drawn last, lines before fills. */
@@ -565,6 +677,45 @@ export default function Whiteboard(props: Props) {
     };
 
     apiRef.current = {
+      addTemplate(key) {
+        if (!joined || myRole === "viewer") return;
+        const r = fitRect(100, 100);
+        sendPicture({ id: newId(), template: key, x: r.x, y: r.y, w: r.w, h: r.h, opacity: 60 });
+      },
+      async uploadPicture(file) {
+        if (!joined || myRole === "viewer") return;
+        try {
+          const up = await prepareUpload(file); // shrunk and re-encoded here; the server checks it again
+          const r = fitRect(up.width, up.height);
+          if (!disposed) sendPicture({ id: newId(), data: up.bytes, x: r.x, y: r.y, w: r.w, h: r.h, opacity: 40 });
+        } catch (err) {
+          setNotice(err instanceof UploadError ? err.message : "That picture could not be used.");
+        }
+      },
+      setPictureOpacity(value) {
+        const item = selectedPicture ? pictures.get(selectedPicture) : undefined;
+        if (!item || !joined || myRole === "viewer") return;
+        opacityBase ??= item.meta; // what to go back to if the server refuses
+        item.meta = { ...item.meta, opacity: Math.min(100, Math.max(5, Math.round(value))) };
+        syncPicture();
+        rebuild();
+        clearTimeout(opacityTimer);
+        opacityTimer = setTimeout(() => {
+          const base = opacityBase;
+          opacityBase = null;
+          const now = pictures.get(item.meta.id);
+          if (base && now) sendPictureUpdate(now.meta, base);
+        }, 350);
+      },
+      removePicture() {
+        const id = selectedPicture;
+        if (!id || !joined || myRole === "viewer") return;
+        socket.timeout(5000).emit("image:remove", { id }, (err, res) => {
+          if (disposed) return;
+          if (err || !res.ok) return setNotice("The picture could not be removed.");
+          removePictureLocal(id);
+        });
+      },
       deleteSelection() {
         if (!joined || myRole === "viewer") return;
         for (const s of strokes.filter((x) => selected.has(x.id) && isSelectable(x))) removeOwn(s, true);
@@ -614,11 +765,24 @@ export default function Whiteboard(props: Props) {
         const g = out.getContext("2d")!;
         g.fillStyle = "#ffffff";
         g.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+        drawPictures(g);
         for (const s of renderOrder(strokes)) drawStroke(g, s);
         out.toBlob((blob) => blob && download(blob, safeFileName(titleRef.current, "png")), "image/png");
       },
       exportSvg() {
-        download(new Blob([strokesToSvg(strokes)], { type: "image/svg+xml" }), safeFileName(titleRef.current, "svg"));
+        const embedded: ExportImage[] = [];
+        for (const { meta, el } of pictures.values()) {
+          const base = { x: meta.x, y: meta.y, w: meta.w, h: meta.h, opacity: meta.opacity };
+          if (meta.template) embedded.push({ ...base, template: meta.template });
+          else if (el && el.complete && el.naturalWidth > 0) {
+            const tmp = document.createElement("canvas"); // the picture is embedded in the file, so it still shows without the board
+            tmp.width = el.naturalWidth;
+            tmp.height = el.naturalHeight;
+            tmp.getContext("2d")!.drawImage(el, 0, 0);
+            embedded.push({ ...base, href: tmp.toDataURL("image/jpeg", 0.85) });
+          }
+        }
+        download(new Blob([strokesToSvg(strokes, embedded)], { type: "image/svg+xml" }), safeFileName(titleRef.current, "svg"));
       },
       rename(newName) {
         socket.timeout(5000).emit("board:rename", { name: newName }, (err, res) => {
@@ -697,6 +861,13 @@ export default function Whiteboard(props: Props) {
         gesture = null;
         syncSel();
         syncUi();
+        pictures.clear();
+        selectedPicture = null;
+        for (const raw of ack.images ?? []) {
+          const one = imageMetaSchema.safeParse(raw);
+          if (one.success) addPicture(one.data);
+        }
+        syncPicture();
         setUsers(ack.users);
         for (const s of pending.values()) if (!strokes.some((x) => x.id === s.id)) strokes.push({ ...s, authorId: clientId });
         rebuild();
@@ -777,6 +948,14 @@ export default function Whiteboard(props: Props) {
         return;
       }
       if (e.pointerType === "mouse" && e.button !== 0) return;
+      const mine = (m: ImageMeta) => myRole === "owner" || m.authorId === clientId; // pictures you added, or any as the owner
+      const current = selectedPicture ? pictures.get(selectedPicture)?.meta : undefined;
+      if (current && mine(current) && onHandle(current, p, 12 / curView.zoom)) {
+        canvas.setPointerCapture(e.pointerId);
+        const [x, y] = toCanvasPointRaw(e.clientX, e.clientY, canvas.getBoundingClientRect(), curView);
+        gesture = { kind: "picture", pointerId: e.pointerId, mode: "resize", id: current.id, start: [x, y], orig: { x: current.x, y: current.y, w: current.w, h: current.h }, moved: false };
+        return;
+      }
       let hit = topHit(p);
       // clicking inside a filled shape picks the shape (and so its fills), not the fill alone
       if (hit?.kind === "fill" && hit.containerId) {
@@ -784,6 +963,7 @@ export default function Whiteboard(props: Props) {
         if (shape && isSelectable(shape)) hit = shape;
       }
       if (hit) {
+        if (selectedPicture) { selectedPicture = null; syncPicture(); } // choosing a stroke lets go of the picture
         const group = expandSelection(strokes, new Set([hit.id]), isSelectable); // the shape and its fills
         if (e.shiftKey) { const had = selected.has(hit.id); for (const id of group) { if (had) selected.delete(id); else selected.add(id); } }
         else if (!selected.has(hit.id)) { selected.clear(); for (const id of group) selected.add(id); }
@@ -796,6 +976,22 @@ export default function Whiteboard(props: Props) {
         schedule();
         return;
       }
+      // no stroke under the pointer: a picture you may change, drawn last on top, is picked next (Shift skips this to box-select)
+      if (!e.shiftKey) {
+        const pic = [...pictures.values()].reverse().find((it) => mine(it.meta) && rectContains(it.meta, p));
+        if (pic) {
+          selected.clear();
+          syncSel();
+          selectedPicture = pic.meta.id;
+          syncPicture();
+          canvas.setPointerCapture(e.pointerId);
+          const [x, y] = toCanvasPointRaw(e.clientX, e.clientY, canvas.getBoundingClientRect(), curView);
+          gesture = { kind: "picture", pointerId: e.pointerId, mode: "move", id: pic.meta.id, start: [x, y], orig: { x: pic.meta.x, y: pic.meta.y, w: pic.meta.w, h: pic.meta.h }, moved: false };
+          schedule();
+          return;
+        }
+      }
+      if (selectedPicture) { selectedPicture = null; syncPicture(); schedule(); }
       if (curView.zoom > 1 && !e.shiftKey) return startPan(e);
       canvas.setPointerCapture(e.pointerId);
       const base = e.shiftKey ? [...selected] : [];
@@ -859,6 +1055,21 @@ export default function Whiteboard(props: Props) {
         return;
       }
       if (gesture && e.pointerId === gesture.pointerId) {
+        if (gesture.kind === "picture") {
+          const [x, y] = toCanvasPointRaw(e.clientX, e.clientY, canvas.getBoundingClientRect(), curView);
+          const dx = x - gesture.start[0], dy = y - gesture.start[1];
+          if (!gesture.moved && Math.hypot(dx, dy) >= 3 / curView.zoom) gesture.moved = true; // a click is not a drag
+          const item = pictures.get(gesture.id);
+          if (gesture.moved && item) {
+            const o = gesture.orig;
+            const next = gesture.mode === "move" ? clampImageRect({ ...o, x: o.x + dx, y: o.y + dy }) : clampImageRect(resizeKeepAspect(o, o.w + dx));
+            item.meta = { ...item.meta, ...next };
+            syncPicture();
+            rebuild();
+          }
+          schedule();
+          return;
+        }
         if (gesture.kind === "move") {
           const [x, y] = toCanvasPointRaw(e.clientX, e.clientY, canvas.getBoundingClientRect(), curView);
           const rawDx = x - gesture.start[0], rawDy = y - gesture.start[1];
@@ -909,6 +1120,10 @@ export default function Whiteboard(props: Props) {
         gesture = null;
         layerDirty = true; // the dragged strokes were left out of the layer
         if (g.kind === "move" && g.moved) performMove(g.ids, g.ids.map(() => newId()), g.dx, g.dy, "move");
+        if (g.kind === "picture" && g.moved) {
+          const item = pictures.get(g.id);
+          if (item) sendPictureUpdate(item.meta, { ...item.meta, ...g.orig });
+        }
         schedule();
         return;
       }
@@ -960,10 +1175,12 @@ export default function Whiteboard(props: Props) {
       }
       if (e.key === "Delete" || e.key === "Backspace") {
         if (selected.size > 0) { e.preventDefault(); apiRef.current.deleteSelection(); }
+        else if (selectedPicture) { e.preventDefault(); apiRef.current.removePicture(); }
         return;
       }
       if (e.key === "Escape") {
         if (selected.size > 0) { selected.clear(); syncSel(); schedule(); }
+        if (selectedPicture) { selectedPicture = null; syncPicture(); schedule(); }
         return;
       }
       if (!(e.ctrlKey || e.metaKey)) return;
@@ -1025,7 +1242,7 @@ export default function Whiteboard(props: Props) {
         ? view.zoom <= 1
           ? "Zoom in (the + button, or Ctrl/Cmd + scroll), then drag to move around."
           : "Drag to move around, or just scroll."
-        : "Click one of your strokes to select it and drag to move it. Drag empty space to select several (zoomed in, empty space moves the view and Shift+drag selects). Delete removes the selection. Holding Space moves the view with any tool."
+        : "Click one of your strokes, or a picture you added, to select it and drag to move it (the square at a picture's corner resizes it). Hold Shift to box-select over a picture. Drag empty space to select several (zoomed in, empty space moves the view and Shift+drag selects). Delete removes the selection. Holding Space moves the view with any tool."
       : tool === "fill"
         ? "Click inside a rectangle, an ellipse or a loop drawn with the pen to fill it. The fill stays with its shape when you move, erase or delete it."
         : tool === "eraser"
@@ -1094,7 +1311,7 @@ export default function Whiteboard(props: Props) {
                 <button
                   key={hex} type="button" aria-label={label} aria-pressed={color === hex}
                   onClick={() => setColor(hex)} style={{ backgroundColor: hex }}
-                  className={`h-7 w-7 rounded-full border-2 ${color === hex ? "border-slate-900 ring-2 ring-slate-400" : "border-white"}`}
+                  className={`h-7 w-7 rounded-full border-2 ${color === hex ? "border-slate-900 ring-2 ring-slate-400" : hex === "#ffffff" ? "border-slate-300" : "border-white"}`}
                 />
               ))}
             </div>
@@ -1105,9 +1322,6 @@ export default function Whiteboard(props: Props) {
             </label>
             <button onClick={() => apiRef.current.undo()} disabled={!canUndo} className={btn}>Undo</button>
             <button onClick={() => apiRef.current.redo()} disabled={!canRedo} className={btn}>Redo</button>
-            {selCount > 0 && (
-              <button onClick={() => apiRef.current.deleteSelection()} className={btn}>Delete selection ({selCount})</button>
-            )}
           </>
         )}
         <div role="group" aria-label="Zoom" className="flex items-center gap-1">
@@ -1115,6 +1329,26 @@ export default function Whiteboard(props: Props) {
           <button aria-label="Reset zoom" onClick={() => apiRef.current.resetView()} className={`${btn} w-16 tabular-nums`}>{Math.round(view.zoom * 100)}%</button>
           <button aria-label="Zoom in" onClick={() => apiRef.current.zoomBy(1.25)} disabled={view.zoom >= MAX_ZOOM} className={btn}>+</button>
         </div>
+        {!readOnly && (
+          <div className="relative">
+            <button type="button" aria-expanded={pictureMenu} onClick={() => setPictureMenu((v) => !v)} className={btn}>Add picture</button>
+            {pictureMenu && (
+              <div role="group" aria-label="Add a picture to trace" className="absolute z-30 mt-1 w-72 rounded border border-slate-300 bg-white p-3 shadow-lg">
+                <button type="button" onClick={() => fileRef.current?.click()} className={`${btn} w-full`}>Upload from this device</button>
+                <p className="mt-2 text-xs text-slate-600">JPEG, PNG or WebP. It is shrunk first. Or trace a built-in outline:</p>
+                <div className="mt-1 flex flex-wrap gap-1">
+                  {TEMPLATES.map((t) => (
+                    <button key={t.key} type="button" onClick={() => { apiRef.current.addTemplate(t.key); setPictureMenu(false); }} className={btn}>{t.label}</button>
+                  ))}
+                </div>
+              </div>
+            )}
+            <input
+              ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp" className="sr-only" aria-label="Choose a picture to upload" tabIndex={-1}
+              onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; setPictureMenu(false); if (f) apiRef.current.uploadPicture(f); }}
+            />
+          </div>
+        )}
         <div role="group" aria-label="Export" className="flex gap-1">
           <button onClick={() => apiRef.current.exportPng()} className={btn}>Export PNG</button>
           <button onClick={() => apiRef.current.exportSvg()} className={btn}>Export SVG</button>
@@ -1163,7 +1397,25 @@ export default function Whiteboard(props: Props) {
       </div>
 
       {/* under the canvas, so showing or hiding it never moves the drawing area */}
-      <p role="note" className="min-h-10 text-sm text-slate-600">{toolHint}</p>
+      {/* one row of fixed height below the canvas: the tool hint and the controls of whatever is selected, so nothing above the drawing area ever moves */}
+      <div className="flex min-h-12 flex-wrap items-center justify-between gap-3">
+        <p role="note" className="max-w-3xl text-sm text-slate-600">{toolHint}</p>
+        <div className="flex flex-wrap items-center gap-2">
+          {selCount > 0 && !readOnly && (
+            <button onClick={() => apiRef.current.deleteSelection()} className={btn}>Delete selection ({selCount})</button>
+          )}
+          {selPicture && !readOnly && (
+            <div role="group" aria-label="Selected picture" className="flex items-center gap-2 rounded border border-blue-300 bg-blue-50 px-2 py-1 text-sm">
+              <label className="flex items-center gap-2">
+                Picture opacity
+                <input type="range" min={5} max={100} value={selPicture.opacity} onChange={(e) => apiRef.current.setPictureOpacity(Number(e.target.value))} />
+                <span className="w-9 tabular-nums">{selPicture.opacity}%</span>
+              </label>
+              <button type="button" onClick={() => apiRef.current.removePicture()} className={btn}>Remove picture</button>
+            </div>
+          )}
+        </div>
+      </div>
 
       <div className="flex flex-wrap items-center gap-2 text-sm">
         <span className="text-slate-600">On this board:</span>

@@ -29,7 +29,8 @@ const config: NextConfig = {
   async headers() {
     return [
       {
-        source: "/:path*",
+        // not for /images/: that route sends its own, stricter headers for uploaded pictures
+        source: "/((?!images/).*)",
         headers: [
           { key: "Content-Security-Policy", value: csp },
           { key: "X-Content-Type-Options", value: "nosniff" },
