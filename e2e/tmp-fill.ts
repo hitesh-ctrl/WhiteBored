@@ -1,0 +1,37 @@
+import "dotenv/config";
+import { chromium } from "playwright";
+import { createPrisma } from "../src/lib/prisma";
+import { enterName, ink, stroke } from "./lib";
+
+const prisma = createPrisma();
+const browser = await chromium.launch();
+const page = await (await browser.newContext({ viewport: { width: 1200, height: 800 } })).newPage();
+const notices: string[] = [];
+page.on("console", (m) => { if (m.type() === "error") notices.push(m.text()); });
+await page.goto("http://localhost:3001");
+await page.fill("#name", "Fill test");
+await page.click("text=Create board");
+await page.waitForURL(/\/board\/[0-9a-f-]{36}/);
+const boardId = page.url().split("/").pop()!.split("#")[0];
+await enterName(page, "Tester");
+const pick = (n: string) => page.getByRole("group", { name: "Tools" }).getByRole("button", { name: n, exact: true }).click();
+await pick("Rectangle");
+await stroke(page, [0.2, 0.2], [0.5, 0.5]);
+await page.waitForTimeout(400);
+const before = await ink(page);
+await page.getByRole("button", { name: "Red", exact: true }).click();
+await pick("Fill");
+const box = (await page.locator("canvas").boundingBox())!;
+await page.mouse.click(box.x + box.width * 0.35, box.y + box.height * 0.35);
+await page.waitForTimeout(800);
+const after = await ink(page);
+const rows = await prisma.stroke.findMany({ where: { boardId }, select: { kind: true, color: true } });
+console.log("ink before/after:", before, after, "| rows:", JSON.stringify(rows), "| notice:", JSON.stringify(await page.locator("[aria-live=polite]").innerText()));
+// click outside any shape: should explain, not fail silently
+await page.mouse.click(box.x + box.width * 0.8, box.y + box.height * 0.8);
+await page.waitForTimeout(300);
+console.log("outside click notice:", JSON.stringify(await page.locator("[aria-live=polite]").innerText()));
+await page.screenshot({ path: "logs/evidence/fill-check.png" });
+await browser.close();
+await prisma.board.delete({ where: { id: boardId } });
+await prisma.$disconnect();

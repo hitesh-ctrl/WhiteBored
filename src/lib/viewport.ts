@@ -39,3 +39,18 @@ export function zoomAt(v: View, newZoom: number, anchor: [number, number]): View
 export function panBy(v: View, dx: number, dy: number): View {
   return clampView({ ...v, panX: v.panX + (dx * CANVAS_WIDTH) / v.zoom, panY: v.panY + (dy * CANVAS_HEIGHT) / v.zoom });
 }
+
+export type WheelInput = { ctrlKey: boolean; metaKey: boolean; deltaX: number; deltaY: number; deltaMode: number };
+export type WheelAction = { kind: "zoom"; factor: number } | { kind: "pan"; dx: number; dy: number } | { kind: "none" };
+
+/**
+ * What a wheel or trackpad event should do. Ctrl or Cmd (a trackpad pinch is sent as Ctrl+wheel)
+ * zooms; a plain scroll moves around when zoomed in; when the whole board is visible it does
+ * nothing so the page can scroll normally. Deltas are in pixels.
+ */
+export function wheelAction(e: WheelInput, zoom: number): WheelAction {
+  const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 100 : 1; // lines and pages to pixels
+  const dx = e.deltaX * unit, dy = e.deltaY * unit;
+  if (e.ctrlKey || e.metaKey) return { kind: "zoom", factor: Math.exp(-Math.max(-2000, Math.min(2000, dy)) * 0.0015) };
+  return zoom > 1 ? { kind: "pan", dx, dy } : { kind: "none" };
+}

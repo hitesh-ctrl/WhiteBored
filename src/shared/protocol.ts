@@ -1,7 +1,7 @@
 import { z } from "zod";
 import {
   CANVAS_HEIGHT, CANVAS_WIDTH, MAX_NAME_LENGTH, MAX_POINTS_PER_BATCH, MAX_POINTS_PER_STROKE,
-  MAX_TEXT_LENGTH, MAX_WIDTH, MIN_WIDTH,
+  MAX_MOVE_STROKES, MAX_TEXT_LENGTH, MAX_WIDTH, MIN_WIDTH,
 } from "./limits";
 
 /* ---------- field schemas ---------- */
@@ -20,7 +20,7 @@ export const widthSchema = z.number().int().min(MIN_WIDTH).max(MAX_WIDTH);
 const coord = (max: number) => z.number().min(0).max(max);
 export const pointSchema = z.tuple([coord(CANVAS_WIDTH), coord(CANVAS_HEIGHT)]);
 
-export const KINDS = ["pen", "line", "arrow", "rect", "ellipse", "text"] as const;
+export const KINDS = ["pen", "line", "arrow", "rect", "ellipse", "text", "fill"] as const;
 export const kindSchema = z.enum(KINDS);
 export type Kind = (typeof KINDS)[number];
 export const textSchema = z
@@ -31,18 +31,20 @@ export const textSchema = z
 
 const strokeBase = { id: idSchema, color: colorSchema, width: widthSchema, kind: kindSchema.default("pen") };
 
-type Shaped = { kind: Kind; points: unknown[]; text?: string };
-/** pen: free points; line, arrow, rect, ellipse: exactly 2 points; text: 1 point plus its content. */
+type Shaped = { kind: Kind; points: unknown[]; text?: string; containerId?: string };
+/** pen: free points; line, arrow, rect, ellipse: exactly 2 points; text: 1 point plus its content; fill: a polygon of 3 or more points. */
 const committedShapeOk = (v: Shaped) => {
+  if (v.containerId !== undefined && v.kind !== "fill") return false; // only a fill can name the shape it fills
   switch (v.kind) {
     case "pen": return v.text === undefined;
     case "text": return v.points.length === 1 && v.text !== undefined;
+    case "fill": return v.points.length >= 3 && v.text === undefined;
     default: return v.points.length === 2 && v.text === undefined;
   }
 };
-/** Live progress: shapes send their current 1 or 2 points, text is never sent as progress. */
+/** Live progress: shapes send their current 1 or 2 points; text and fills are never sent as progress. */
 const progressShapeOk = (v: Shaped) => {
-  if (v.text !== undefined || v.kind === "text") return false;
+  if (v.text !== undefined || v.containerId !== undefined || v.kind === "text" || v.kind === "fill") return false;
   return v.kind === "pen" ? true : v.points.length <= 2;
 };
 
@@ -50,11 +52,13 @@ const commitBase = z.object({
   ...strokeBase,
   points: z.array(pointSchema).min(1).max(MAX_POINTS_PER_STROKE),
   text: textSchema.optional(),
+  containerId: idSchema.optional(),
 });
 const progressBase = z.object({
   ...strokeBase,
   points: z.array(pointSchema).min(1).max(MAX_POINTS_PER_BATCH),
   text: textSchema.optional(),
+  containerId: idSchema.optional(),
 });
 
 /** A finished stroke as sent by the browser. */
@@ -74,6 +78,14 @@ export const joinSchema = z
   })
   .refine((v) => (v.boardId === undefined) !== (v.viewId === undefined), "give exactly one of boardId and viewId");
 export const renameSchema = z.object({ name: nameSchema });
+export const moveSchema = z
+  .object({
+    moves: z.array(z.object({ id: idSchema, newId: idSchema })).min(1).max(MAX_MOVE_STROKES),
+    dx: z.number().min(-CANVAS_WIDTH).max(CANVAS_WIDTH),
+    dy: z.number().min(-CANVAS_HEIGHT).max(CANVAS_HEIGHT),
+  })
+  // old and new ids must all be different from each other, so a request can never name a stroke twice
+  .refine((v) => new Set(v.moves.flatMap((m) => [m.id, m.newId])).size === v.moves.length * 2, "ids must all be different");
 export const undoSchema = z.object({ id: idSchema });
 export const cursorSchema = z.object({ x: coord(CANVAS_WIDTH), y: coord(CANVAS_HEIGHT) });
 
@@ -82,6 +94,7 @@ export const cursorSchema = z.object({ x: coord(CANVAS_WIDTH), y: coord(CANVAS_H
 export const authoredStrokeSchema = commitBase.extend({ authorId: idSchema }).refine(committedShapeOk);
 export const authoredProgressSchema = progressBase.extend({ authorId: idSchema }).refine(progressShapeOk);
 export const renamedSchema = z.object({ name: z.string() });
+export const movedSchema = z.object({ removed: z.array(idSchema).max(MAX_MOVE_STROKES), added: z.array(authoredStrokeSchema).max(MAX_MOVE_STROKES) });
 export const userSchema = z.object({ id: idSchema, name: z.string() });
 export const removeSchema = z.object({ id: idSchema });
 export const userLeftSchema = z.object({ id: idSchema });
@@ -103,6 +116,8 @@ export type ErrorCode =
   | "board_full" | "forbidden" | "rate_limited" | "internal";
 
 export type Ack = { ok: true } | { ok: false; error: ErrorCode };
+export type MoveInput = z.input<typeof moveSchema>;
+export type MoveAck = { ok: true; strokes: Stroke[] } | { ok: false; error: ErrorCode };
 export type Role = "owner" | "editor" | "viewer";
 export type JoinAck =
   | {
@@ -123,6 +138,7 @@ export interface ClientToServerEvents {
   "stroke:progress": (p: ProgressInput) => void;
   "stroke:commit": (p: StrokeInput, ack: (r: Ack) => void) => void;
   "stroke:undo": (p: { id: string }, ack: (r: Ack) => void) => void;
+  "stroke:move": (p: MoveInput, ack: (r: MoveAck) => void) => void;
   "board:clear": (ack: (r: Ack) => void) => void;
   "cursor:move": (p: { x: number; y: number }) => void;
   "laser:move": (p: { x: number; y: number }) => void;
@@ -134,6 +150,7 @@ export interface ServerToClientEvents {
   "stroke:progress": (p: ProgressMessage) => void;
   "stroke:commit": (p: Stroke) => void;
   "stroke:remove": (p: { id: string }) => void;
+  "stroke:moved": (p: { removed: string[]; added: Stroke[] }) => void;
   "board:cleared": () => void;
   "user:joined": (p: User) => void;
   "user:left": (p: { id: string }) => void;

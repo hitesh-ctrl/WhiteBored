@@ -14,6 +14,14 @@ export function drawStroke(ctx: CanvasRenderingContext2D, s: Drawable) {
   if (!a) return;
 
   switch (s.kind) {
+    case "fill":
+      if (s.points.length < 3) return;
+      ctx.beginPath();
+      ctx.moveTo(a[0], a[1]);
+      for (const p of s.points.slice(1)) ctx.lineTo(p[0], p[1]);
+      ctx.closePath();
+      ctx.fill();
+      return;
     case "text":
       ctx.font = `${fontSizeFor(s.width)}px sans-serif`;
       ctx.textBaseline = "top";
@@ -66,4 +74,9 @@ export function drawStroke(ctx: CanvasRenderingContext2D, s: Drawable) {
 export function safeFileName(name: string, ext: string): string {
   const base = name.replace(/[^\p{L}\p{N}_-]+/gu, "-").replace(/^-+|-+$/g, "").slice(0, 40);
   return `${base || "board"}.${ext}`;
+}
+
+/** Fills go underneath everything else, so a fill never hides an outline drawn before it. Stable within each group. */
+export function renderOrder<T extends { kind: string }>(items: T[]): T[] {
+  return [...items.filter((s) => s.kind === "fill"), ...items.filter((s) => s.kind !== "fill")];
 }

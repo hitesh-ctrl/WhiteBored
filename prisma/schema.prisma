@@ -27,6 +27,8 @@ model Stroke {
   /// SHA-256 hex of the author's secret client key. Null for strokes made without one.
   authorProof String?
   kind       String   @default("pen")
+  /// For a fill: the id of the shape it fills, so it moves with that shape. Not a foreign key.
+  containerId String? @db.Uuid
   text       String?
   color      String
   width      Int

@@ -52,4 +52,17 @@ describe("strokesToSvg", () => {
     ]);
     expect(svg.indexOf("#111111")).toBeLessThan(svg.indexOf("#222222"));
   });
+  it("draws a fill as a polygon and puts it under lines even if it was made later", () => {
+    const svg = strokesToSvg([
+      { ...base, id: "1", color: "#111111", kind: "rect", points: pt([0, 0], [10, 10]) },
+      { ...base, id: "2", color: "#abcdef", kind: "fill", width: 1, points: pt([0, 0], [10, 0], [10, 10], [0, 10]) },
+    ]);
+    expect(svg).toMatch(/<polygon[^>]*points="0,0 10,0 10,10 0,10"[^>]*fill="#abcdef"/);
+    expect(svg.indexOf("#abcdef")).toBeLessThan(svg.indexOf("#111111"));
+  });
+  it("replaces a malformed fill colour", () => {
+    const svg = strokesToSvg([{ ...base, color: 'x" onload="alert(1)', kind: "fill", width: 1, points: pt([0, 0], [1, 0], [1, 1]) }]);
+    expect(svg).not.toContain("onload");
+    expect(svg).toContain('fill="#000000"');
+  });
 });

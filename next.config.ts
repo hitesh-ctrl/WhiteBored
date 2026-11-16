@@ -20,6 +20,8 @@ const csp = [
 ].join("; ");
 
 const config: NextConfig = {
+  // a separate build folder lets `npm run share` build while the dev server is running
+  distDir: process.env.NEXT_DIST_DIR || ".next",
   poweredByHeader: false,
   agentRules: false,
   async headers() {

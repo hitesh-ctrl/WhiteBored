@@ -19,10 +19,11 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "e2e": "NEXT_PUBLIC_SOCKET_URL=http://localhost:4100 next build && tsx e2e/run.ts && tsx e2e/features.ts",
+    "e2e": "NEXT_DIST_DIR=.next-e2e NEXT_PUBLIC_SOCKET_URL=http://localhost:4100 next build && NEXT_DIST_DIR=.next-e2e tsx e2e/run.ts && NEXT_DIST_DIR=.next-e2e tsx e2e/features.ts",
     "probes": "tsx security/probes.ts",
     "xss": "tsx security/xss.ts",
-    "bench": "tsx bench/latency.ts"
+    "bench": "tsx bench/latency.ts",
+    "share": "node scripts/share.mjs"
   },
   "dependencies": {
     "@prisma/adapter-pg": "7.10.1",

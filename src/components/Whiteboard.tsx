@@ -4,19 +4,22 @@ import { useEffect, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
 import { colorFor } from "../lib/color";
 import { nextBatch, ownStrokeIds, shouldAddPoint, toCanvasPoint } from "../lib/drawing";
+import { findFillContainer } from "../lib/fill";
 import { strokeHit } from "../lib/geometry";
 import { UndoRedo } from "../lib/history";
 import { newId } from "../lib/ids";
 import { RECENT_KEY, parseRecent, upsertRecent } from "../lib/recent";
-import { drawStroke, safeFileName, type Drawable } from "../lib/render";
+import { expandSelection, normalizeRect, selectionBounds, strokesInRect } from "../lib/selection";
+import { drawStroke, renderOrder, safeFileName, type Drawable } from "../lib/render";
 import { strokesToSvg } from "../lib/svgExport";
 import { throttle } from "../lib/throttle";
-import { DEFAULT_VIEW, MAX_ZOOM, clampView, zoomAt, type View } from "../lib/viewport";
+import { DEFAULT_VIEW, MAX_ZOOM, clampView, wheelAction, zoomAt, type View } from "../lib/viewport";
 import { CANVAS_HEIGHT, CANVAS_WIDTH, MAX_POINTS_PER_STROKE, MAX_TEXT_LENGTH, fontSizeFor } from "../shared/limits";
+import { clampDelta, pointsBounds, translatePoints } from "../shared/move";
 import {
-  BAD_TEXT_CHARS, authoredProgressSchema, authoredStrokeSchema, remoteCursorSchema, removeSchema, renamedSchema,
+  BAD_TEXT_CHARS, authoredProgressSchema, authoredStrokeSchema, movedSchema, remoteCursorSchema, removeSchema, renamedSchema,
   userLeftSchema, userSchema,
-  type ClientToServerEvents, type Kind, type Point, type Role, type ServerToClientEvents, type Stroke,
+  type ClientToServerEvents, type Kind, type MoveAck, type MoveInput, type Point, type Role, type ServerToClientEvents, type Stroke,
   type StrokeInput, type User,
 } from "../shared/protocol";
 
@@ -26,7 +29,7 @@ const COLORS = [
   ["Green", "#16a34a"], ["Blue", "#2563eb"], ["Purple", "#7c3aed"], ["Pink", "#db2777"],
 ] as const;
 const TOOLS = [
-  ["pen", "Pen"], ["eraser", "Eraser"], ["line", "Line"], ["arrow", "Arrow"], ["rect", "Rectangle"],
+  ["pen", "Pen"], ["eraser", "Eraser"], ["fill", "Fill"], ["line", "Line"], ["arrow", "Arrow"], ["rect", "Rectangle"],
   ["ellipse", "Ellipse"], ["text", "Text"], ["laser", "Laser"], ["hand", "Hand"],
 ] as const;
 type Tool = (typeof TOOLS)[number][0];
@@ -44,9 +47,10 @@ type Api = {
   exportPng(): void; exportSvg(): void;
   rename(name: string): void;
   commitText(x: number, y: number, text: string): void;
+  deleteSelection(): void;
 };
 const noApi: Api = {
-  undo() {}, redo() {}, clear() {}, zoomBy() {}, resetView() {}, exportPng() {}, exportSvg() {}, rename() {}, commitText() {},
+  undo() {}, redo() {}, clear() {}, zoomBy() {}, resetView() {}, exportPng() {}, exportSvg() {}, rename() {}, commitText() {}, deleteSelection() {},
 };
 
 type Props = { boardId?: string; viewId?: string; boardName: string; name: string; clientId: string; clientKey: string; ownerKey?: string };
@@ -78,6 +82,8 @@ export default function Whiteboard(props: Props) {
   const [shareViewId, setShareViewId] = useState<string | undefined>();
   const [view, setViewUi] = useState<View>(DEFAULT_VIEW);
   const [textDraft, setTextDraft] = useState<{ x: number; y: number; px: number } | null>(null);
+  const [panningUi, setPanningUi] = useState(false);
+  const [selCount, setSelCount] = useState(0);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState("");
 
@@ -116,9 +122,19 @@ export default function Whiteboard(props: Props) {
     let joined = false;
     let buffer: (() => void)[] = [];
     let raf = 0;
+    let layerDirty = true; // the saved-strokes layer must be redrawn before the next frame
+    let spaceDown = false; // Space held: any tool temporarily moves the board
     let drawing: (Drawable & { id: string; kind: Kind; sent: number; dirty: boolean; pointerId: number; timer: ReturnType<typeof setInterval> }) | null = null;
     let panning: { pointerId: number; x: number; y: number; view: View } | null = null;
     let erasingPointer: number | null = null;
+    /** Strokes that were moved together: new id to the group, so undo can move them back as one. */
+    type MoveGroup = { ids: string[]; origIds: string[]; dx: number; dy: number };
+    const selected = new Set<string>();
+    const moveGroups = new Map<string, MoveGroup>();
+    let gesture:
+      | { kind: "move"; pointerId: number; start: Point; ids: string[]; dx: number; dy: number; moved: boolean }
+      | { kind: "marquee"; pointerId: number; start: Point; cur: Point; base: string[] }
+      | null = null;
 
     const socket: Socket<ServerToClientEvents, ClientToServerEvents> = io(SOCKET_URL, { transports: ["websocket"] });
 
@@ -127,18 +143,49 @@ export default function Whiteboard(props: Props) {
       c.setTransform(curView.zoom, 0, 0, curView.zoom, -curView.panX * curView.zoom, -curView.panY * curView.zoom);
     const paint = () => {
       raf = 0;
+      if (layerDirty) {
+        layerDirty = false;
+        cctx.setTransform(1, 0, 0, 1, 0, 0);
+        cctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+        viewTransform(cctx); // stays set, so new strokes can be drawn straight onto the layer
+        // strokes being dragged are drawn separately at their new place, so they are left out here
+        const hide = gesture?.kind === "move" && gesture.moved ? new Set(gesture.ids) : null;
+        for (const s of renderOrder(hide ? strokes.filter((x) => !hide.has(x.id)) : strokes)) drawStroke(cctx, s);
+      }
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
       ctx.drawImage(committed, 0, 0);
       viewTransform(ctx);
       for (const s of live.values()) drawStroke(ctx, s);
+
+      // selection: the dragged copies, a dashed box around the selection, and the box being dragged out
+      let shown: Drawable[] = strokes.filter((s) => selected.has(s.id));
+      if (gesture?.kind === "move" && gesture.moved) {
+        const g = gesture;
+        shown = shown.map((s) => ({ ...s, points: translatePoints(s.points, g.dx, g.dy) }));
+        for (const s of shown) drawStroke(ctx, s);
+      }
+      const box = selectionBounds(shown);
+      ctx.save();
+      ctx.strokeStyle = "#2563eb";
+      ctx.lineWidth = 1.5 / curView.zoom;
+      ctx.setLineDash([6 / curView.zoom, 4 / curView.zoom]);
+      if (box) {
+        const pad = 4 / curView.zoom;
+        ctx.strokeRect(box.x - pad, box.y - pad, box.w + 2 * pad, box.h + 2 * pad);
+      }
+      if (gesture?.kind === "marquee") {
+        const r = normalizeRect(gesture.start, gesture.cur);
+        ctx.fillStyle = "rgba(37, 99, 235, 0.08)";
+        ctx.fillRect(r.x, r.y, r.w, r.h);
+        ctx.strokeRect(r.x, r.y, r.w, r.h);
+      }
+      ctx.restore();
     };
     const schedule = () => { raf ||= requestAnimationFrame(paint); };
+    /** Redraw the saved strokes once per frame, however many changes arrive (panning sends many). */
     const rebuild = () => {
-      cctx.setTransform(1, 0, 0, 1, 0, 0);
-      cctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-      viewTransform(cctx); // stays set, so new strokes can be drawn straight onto the layer
-      for (const s of strokes) drawStroke(cctx, s);
+      layerDirty = true;
       schedule();
     };
     const place = (el: HTMLElement, x: number, y: number) => {
@@ -159,12 +206,14 @@ export default function Whiteboard(props: Props) {
       setCanUndo(hist.size() > 0);
       setCanRedo(hist.canRedo());
     };
+    const syncSel = () => setSelCount(selected.size);
 
     /* ----- state changes ----- */
     const addStroke = (s: Stroke) => {
       if (strokes.some((x) => x.id === s.id)) return;
       strokes.push(s);
-      drawStroke(cctx, s);
+      if (s.kind === "fill") rebuild(); // fills sit under everything, so the layer is redrawn
+      else drawStroke(cctx, s);
       live.delete(`${s.authorId}:${s.id}`);
       liveSeen.delete(`${s.authorId}:${s.id}`);
       schedule();
@@ -175,11 +224,17 @@ export default function Whiteboard(props: Props) {
       pending.delete(id);
       if (undoWhenSaved === id) undoWhenSaved = null;
       hist.remove(id);
+      moveGroups.delete(id);
+      if (selected.delete(id)) syncSel();
       syncUi();
       rebuild();
     };
     const clearAll = () => {
       strokes.length = 0;
+      selected.clear();
+      moveGroups.clear();
+      gesture = null;
+      syncSel();
       hist.reset([]);
       undoWhenSaved = null;
       syncUi();
@@ -273,6 +328,13 @@ export default function Whiteboard(props: Props) {
       const p = removeSchema.safeParse(raw);
       if (p.success) removeStroke(p.data.id);
     }));
+    socket.on("stroke:moved", gate((raw) => {
+      const p = movedSchema.safeParse(raw);
+      if (!p.success) return;
+      for (const id of p.data.removed) removeStroke(id);
+      for (const s of p.data.added) addStroke(s);
+      rebuild();
+    }));
     socket.on("board:cleared", gate(() => clearAll()));
     socket.on("board:renamed", gate((raw) => {
       const p = renamedSchema.safeParse(raw);
@@ -294,6 +356,19 @@ export default function Whiteboard(props: Props) {
       for (const k of [...live.keys()]) if (k.startsWith(`${p.data.id}:`)) live.delete(k);
       schedule();
     }));
+    /** A laser dot that disappears when it stops moving. Used for other people's lasers and for our own. */
+    const showLaser = (id: string, label: string, x: number, y: number) => {
+      let l = lasers.get(id);
+      if (!l) {
+        l = { el: makeMarker(id, label, "laser"), x: 0, y: 0, timer: setTimeout(() => {}, 0) };
+        lasers.set(id, l);
+      }
+      l.x = x;
+      l.y = y;
+      place(l.el, x, y);
+      clearTimeout(l.timer);
+      l.timer = setTimeout(() => removeLaser(id), 1500);
+    };
     socket.on("cursor:move", (raw) => {
       if (!joined) return;
       const p = remoteCursorSchema.safeParse(raw);
@@ -311,16 +386,7 @@ export default function Whiteboard(props: Props) {
       if (!joined) return;
       const p = remoteCursorSchema.safeParse(raw);
       if (!p.success) return;
-      let l = lasers.get(p.data.id);
-      if (!l) {
-        l = { el: makeMarker(p.data.id, p.data.name, "laser"), x: 0, y: 0, timer: setTimeout(() => {}, 0) };
-        lasers.set(p.data.id, l);
-      }
-      l.x = p.data.x;
-      l.y = p.data.y;
-      place(l.el, l.x, l.y);
-      clearTimeout(l.timer);
-      l.timer = setTimeout(() => removeLaser(p.data.id), 1500); // the laser disappears when it stops moving
+      showLaser(p.data.id, p.data.name, p.data.x, p.data.y);
     });
 
     // A remote stroke whose author never committed it (rejected, or the author lost connection)
@@ -364,7 +430,8 @@ export default function Whiteboard(props: Props) {
     /** Draw, remember for undo, and send a finished stroke. `again` marks a redo (keeps the redo list). */
     const commitLocal = (s: StrokeInput, again = false) => {
       strokes.push({ ...s, authorId: clientId });
-      drawStroke(cctx, s);
+      if (s.kind === "fill") rebuild();
+      else drawStroke(cctx, s);
       if (again) hist.restore(s.id);
       else hist.recordDraw(s.id);
       syncUi();
@@ -373,25 +440,25 @@ export default function Whiteboard(props: Props) {
       schedule();
     };
     /** Removes one of our own strokes on the server, then locally. Used by undo and by the eraser. */
-    const removeOwn = (stroke: Stroke, optimistic: boolean) => {
+    const removeOwn = (stroke: Stroke, optimistic: boolean, keepForRedo = true) => {
       if (optimistic) {
         erasing.add(stroke.id);
         removeStroke(stroke.id);
       }
-      sendRemove(stroke, optimistic, 0);
+      sendRemove(stroke, optimistic, 0, keepForRedo);
     };
-    const sendRemove = (stroke: Stroke, optimistic: boolean, attempt: number) => {
+    const sendRemove = (stroke: Stroke, optimistic: boolean, attempt: number, keepForRedo: boolean) => {
       socket.timeout(5000).emit("stroke:undo", { id: stroke.id }, (err, res) => {
         if (disposed) return;
         if (!err && !res.ok && res.error === "rate_limited" && attempt < 6) {
           // a long sweep with the eraser can outrun the server's limit; wait instead of giving the stroke back
-          setTimeout(() => { if (!disposed) sendRemove(stroke, optimistic, attempt + 1); }, 200 * (attempt + 1));
+          setTimeout(() => { if (!disposed) sendRemove(stroke, optimistic, attempt + 1, keepForRedo); }, 200 * (attempt + 1));
           return;
         }
         erasing.delete(stroke.id);
         if (!err && (res.ok || res.error === "forbidden")) {
           if (!optimistic) removeStroke(stroke.id);
-          if (res.ok) { hist.pushRedo(stroke); syncUi(); }
+          if (res.ok && keepForRedo) { hist.pushRedo(stroke); syncUi(); }
           return;
         }
         if (optimistic) { // could not remove it, so put it back
@@ -403,7 +470,105 @@ export default function Whiteboard(props: Props) {
       });
     };
 
+    /* ----- selecting and moving ----- */
+    const isSelectable = (s: Stroke) => s.authorId === clientId && !pending.has(s.id) && !erasing.has(s.id);
+    /** The person's own stroke under the pointer: the one drawn last, lines before fills. */
+    const topHit = (p: Point): Stroke | undefined => {
+      const radius = ERASER_RADIUS_PX / curView.zoom;
+      const hits = strokes.filter((s) => isSelectable(s) && strokeHit(s, p, radius));
+      const lines = hits.filter((s) => s.kind !== "fill");
+      const pool = lines.length ? lines : hits;
+      return pool[pool.length - 1];
+    };
+    const sendMove = (req: MoveInput, attempt: number, done: (res: MoveAck | null) => void) => {
+      socket.timeout(5000).emit("stroke:move", req, (err, res) => {
+        if (disposed) return;
+        if (err) return attempt < 2 ? sendMove(req, attempt + 1, done) : done(null); // same new ids, so a repeat cannot move twice
+        if (!res.ok && res.error === "rate_limited" && attempt < 6) {
+          setTimeout(() => { if (!disposed) sendMove(req, attempt + 1, done); }, 200 * (attempt + 1));
+          return;
+        }
+        done(res);
+      });
+    };
+    /**
+     * Move strokes (or move them back, for undo). The browser shows the result at once under the
+     * new ids; the server replaces the old strokes with translated copies, and a refusal puts
+     * everything back.
+     */
+    const performMove = (oldIds: string[], newIds: string[], dx: number, dy: number, mode: "move" | "undo"): boolean => {
+      const olds = oldIds.map((id) => strokes.find((s) => s.id === id)).filter((s): s is Stroke => !!s);
+      if (olds.length !== oldIds.length || !joined || myRole === "viewer") return false;
+      const shift = clampDelta(pointsBounds(olds.flatMap((s) => s.points)), dx, dy);
+      if (mode === "move" && shift.dx === 0 && shift.dy === 0) return false;
+      const renumbered = new Map(oldIds.map((id, i) => [id, newIds[i]]));
+      // a fill follows its shape: its copy points at the shape's new id (the server does the same)
+      const news: Stroke[] = olds.map((s, i) => {
+        const { containerId, ...rest } = s;
+        const next = containerId ? renumbered.get(containerId) : undefined;
+        return { ...rest, id: newIds[i], points: translatePoints(s.points, shift.dx, shift.dy), ...(next ? { containerId: next } : {}) };
+      });
+      const oldGroups = oldIds.map((id) => moveGroups.get(id));
+
+      for (const s of olds) {
+        strokes.splice(strokes.findIndex((x) => x.id === s.id), 1);
+        hist.remove(s.id);
+        moveGroups.delete(s.id);
+        selected.delete(s.id);
+      }
+      for (const s of news) { strokes.push(s); erasing.add(s.id); } // busy until the server answers
+      selected.clear();
+      if (mode === "move") {
+        for (const id of newIds) { moveGroups.set(id, { ids: newIds, origIds: oldIds, dx: shift.dx, dy: shift.dy }); hist.recordDraw(id); selected.add(id); }
+      } else {
+        for (const id of newIds) hist.restore(id);
+      }
+      syncSel();
+      syncUi();
+      rebuild();
+
+      sendMove({ moves: oldIds.map((id, i) => ({ id, newId: newIds[i] })), dx: shift.dx, dy: shift.dy }, 0, (res) => {
+        for (const id of newIds) erasing.delete(id);
+        if (res?.ok) {
+          for (const sv of res.strokes) { // the server's copy is the truth
+            const i = strokes.findIndex((x) => x.id === sv.id);
+            if (i >= 0) strokes[i] = sv;
+          }
+          rebuild();
+          return;
+        }
+        if (res === null) { // no answer: reload the board, which shows whichever state the server has
+          setNotice("The move could not be confirmed, reloading the board.");
+          socket.disconnect();
+          socket.connect();
+          return;
+        }
+        for (const s of news) {
+          const i = strokes.findIndex((x) => x.id === s.id);
+          if (i >= 0) strokes.splice(i, 1);
+          hist.remove(s.id);
+          moveGroups.delete(s.id);
+          selected.delete(s.id);
+        }
+        for (const s of olds) strokes.push(s);
+        oldIds.forEach((id, i) => { hist.restore(id); const g = oldGroups[i]; if (g) moveGroups.set(id, g); });
+        selected.clear();
+        syncSel();
+        syncUi();
+        rebuild();
+        setNotice("The strokes could not be moved.");
+      });
+      return true;
+    };
+
     apiRef.current = {
+      deleteSelection() {
+        if (!joined || myRole === "viewer") return;
+        for (const s of strokes.filter((x) => selected.has(x.id) && isSelectable(x))) removeOwn(s, true);
+        selected.clear();
+        syncSel();
+        schedule();
+      },
       undo() {
         const id = hist.top();
         if (!joined || myRole === "viewer" || !id) return;
@@ -411,6 +576,12 @@ export default function Whiteboard(props: Props) {
           undoWhenSaved = id; // the server does not know this stroke yet, undo as soon as it is saved
           return;
         }
+        const group = moveGroups.get(id);
+        if (group && group.ids.every((i) => strokes.some((s) => s.id === i) && !erasing.has(i) && !pending.has(i))) {
+          performMove(group.ids, group.origIds, -group.dx, -group.dy, "undo"); // undo of a move: move back
+          return;
+        }
+        moveGroups.delete(id);
         const stroke = strokes.find((s) => s.id === id);
         if (!stroke || erasing.has(id)) return;
         erasing.add(id);
@@ -420,7 +591,7 @@ export default function Whiteboard(props: Props) {
         if (!joined || myRole === "viewer") return;
         const s = hist.popRedo();
         if (!s) return;
-        commitLocal({ id: s.id, kind: s.kind, color: s.color, width: s.width, points: s.points, ...(s.text ? { text: s.text } : {}) }, true);
+        commitLocal({ id: s.id, kind: s.kind, color: s.color, width: s.width, points: s.points, ...(s.text ? { text: s.text } : {}), ...(s.containerId ? { containerId: s.containerId } : {}) }, true);
       },
       clear() {
         if (!joined || !myCanClear || !window.confirm("Clear the whole board for everyone?")) return;
@@ -440,7 +611,7 @@ export default function Whiteboard(props: Props) {
         const g = out.getContext("2d")!;
         g.fillStyle = "#ffffff";
         g.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-        for (const s of strokes) drawStroke(g, s);
+        for (const s of renderOrder(strokes)) drawStroke(g, s);
         out.toBlob((blob) => blob && download(blob, safeFileName(titleRef.current, "png")), "image/png");
       },
       exportSvg() {
@@ -517,6 +688,11 @@ export default function Whiteboard(props: Props) {
         const own = ownStrokeIds(strokes, clientId);
         for (const id of pending.keys()) if (!strokes.some((s) => s.id === id)) own.push(id);
         hist.reset(own);
+        selected.clear();
+        moveGroups.clear();
+        erasing.clear();
+        gesture = null;
+        syncSel();
         syncUi();
         setUsers(ack.users);
         for (const s of pending.values()) if (!strokes.some((x) => x.id === s.id)) strokes.push({ ...s, authorId: clientId });
@@ -571,22 +747,67 @@ export default function Whiteboard(props: Props) {
     const eraseAt = (p: Point) => {
       if (!joined) return;
       const radius = ERASER_RADIUS_PX / curView.zoom;
-      for (const s of [...strokes]) {
-        if (s.authorId !== clientId || pending.has(s.id) || erasing.has(s.id)) continue;
-        if (strokeHit(s, p, radius)) removeOwn(s, true);
+      const hits = strokes.filter(
+        (s) => s.authorId === clientId && !pending.has(s.id) && !erasing.has(s.id) && strokeHit(s, p, radius),
+      );
+      // Lines inside a filled area come first; the fill itself only goes when nothing else is under the pointer.
+      const lines = hits.filter((s) => s.kind !== "fill");
+      const doomed = new Set(lines.length ? lines : hits);
+      // erasing a shape takes its own fills with it
+      for (const s of [...doomed]) {
+        if (s.kind === "fill") continue;
+        for (const f of strokes) if (f.kind === "fill" && f.containerId === s.id && isSelectable(f)) doomed.add(f);
       }
+      for (const s of doomed) removeOwn(s, true);
+    };
+
+    const startPan = (e: PointerEvent) => {
+      canvas.setPointerCapture(e.pointerId);
+      panning = { pointerId: e.pointerId, x: e.clientX, y: e.clientY, view: curView };
+      setPanningUi(true);
+    };
+    /** The Hand tool: select, move and box-select your strokes; empty space moves the view when zoomed in. */
+    const handDown = (e: PointerEvent) => {
+      const p = point(e);
+      if (!joined || myRole === "viewer") {
+        if (curView.zoom > 1) startPan(e);
+        return;
+      }
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+      let hit = topHit(p);
+      // clicking inside a filled shape picks the shape (and so its fills), not the fill alone
+      if (hit?.kind === "fill" && hit.containerId) {
+        const shape = strokes.find((s) => s.id === hit!.containerId);
+        if (shape && isSelectable(shape)) hit = shape;
+      }
+      if (hit) {
+        const group = expandSelection(strokes, new Set([hit.id]), isSelectable); // the shape and its fills
+        if (e.shiftKey) { const had = selected.has(hit.id); for (const id of group) { if (had) selected.delete(id); else selected.add(id); } }
+        else if (!selected.has(hit.id)) { selected.clear(); for (const id of group) selected.add(id); }
+        syncSel();
+        if (selected.has(hit.id)) {
+          canvas.setPointerCapture(e.pointerId);
+          const [x, y] = toCanvasPointRaw(e.clientX, e.clientY, canvas.getBoundingClientRect(), curView);
+          gesture = { kind: "move", pointerId: e.pointerId, start: [x, y], ids: [...selected], dx: 0, dy: 0, moved: false };
+        }
+        schedule();
+        return;
+      }
+      if (curView.zoom > 1 && !e.shiftKey) return startPan(e);
+      canvas.setPointerCapture(e.pointerId);
+      const base = e.shiftKey ? [...selected] : [];
+      if (!e.shiftKey) { selected.clear(); syncSel(); }
+      gesture = { kind: "marquee", pointerId: e.pointerId, start: p, cur: p, base };
+      schedule();
     };
 
     const onDown = (e: PointerEvent) => {
       const t = toolRef.current;
-      const wantsPan = t === "hand" || e.button === 1;
-      if (!e.isPrimary && !wantsPan) return;
-      if (drawing || panning || erasingPointer !== null) return;
-      if (wantsPan) {
-        canvas.setPointerCapture(e.pointerId);
-        panning = { pointerId: e.pointerId, x: e.clientX, y: e.clientY, view: curView };
-        return;
-      }
+      const forcePan = e.button === 1 || spaceDown;
+      if (!e.isPrimary && !forcePan) return;
+      if (drawing || panning || gesture || erasingPointer !== null) return;
+      if (forcePan) return startPan(e);
+      if (t === "hand") return handDown(e);
       if (!joined || myRole === "viewer" || t === "laser" || (e.pointerType === "mouse" && e.button !== 0)) return;
       if (t === "text") {
         const p = point(e);
@@ -594,6 +815,15 @@ export default function Whiteboard(props: Props) {
         textDoneRef.current = false;
         setTextDraft({ x: p[0], y: p[1], px: (fontSizeFor(widthRef.current) * curView.zoom * rect.width) / CANVAS_WIDTH });
         e.preventDefault();
+        return;
+      }
+      if (t === "fill") {
+        e.preventDefault();
+        const container = findFillContainer(strokes, point(e));
+        if (!container) return setNotice("Click inside a closed shape: a rectangle, an ellipse or a loop drawn with the pen.");
+        // a new colour replaces this person's earlier fill of the same shape instead of stacking on it
+        for (const old of strokes.filter((s) => s.kind === "fill" && s.containerId === container.id && isSelectable(s))) removeOwn(old, true, false);
+        commitLocal({ id: newId(), kind: "fill", color: colorRef.current, width: 1, containerId: container.id, points: container.polygon });
         return;
       }
       canvas.setPointerCapture(e.pointerId);
@@ -625,7 +855,30 @@ export default function Whiteboard(props: Props) {
         });
         return;
       }
-      if (joined) (toolRef.current === "laser" ? sendLaser : sendCursor)(point(e));
+      if (gesture && e.pointerId === gesture.pointerId) {
+        if (gesture.kind === "move") {
+          const [x, y] = toCanvasPointRaw(e.clientX, e.clientY, canvas.getBoundingClientRect(), curView);
+          const rawDx = x - gesture.start[0], rawDy = y - gesture.start[1];
+          const group = gesture.ids.map((id) => strokes.find((s) => s.id === id)).filter((s): s is Stroke => !!s);
+          const c = clampDelta(pointsBounds(group.flatMap((s) => s.points)), rawDx, rawDy);
+          gesture.dx = c.dx;
+          gesture.dy = c.dy;
+          if (!gesture.moved && Math.hypot(rawDx, rawDy) >= 3 / curView.zoom) { gesture.moved = true; layerDirty = true; } // a click is not a drag
+        } else {
+          gesture.cur = point(e);
+          const inside = strokesInRect(strokes, normalizeRect(gesture.start, gesture.cur), isSelectable).map((s) => s.id);
+          selected.clear();
+          for (const id of expandSelection(strokes, new Set([...gesture.base, ...inside]), isSelectable)) selected.add(id);
+          syncSel();
+        }
+        schedule();
+        return;
+      }
+      if (toolRef.current === "laser") {
+        const p = point(e);
+        showLaser(clientId, "You", p[0], p[1]); // the server never echoes to the sender, so show our own dot here
+        if (joined) sendLaser(p);
+      } else if (joined) sendCursor(point(e));
       if (erasingPointer === e.pointerId) {
         for (const ev of e.getCoalescedEvents?.() ?? [e]) eraseAt(point(ev));
         return;
@@ -646,8 +899,16 @@ export default function Whiteboard(props: Props) {
       schedule();
     };
     const onUp = (e: PointerEvent) => {
-      if (panning && e.pointerId === panning.pointerId) { panning = null; return; }
+      if (panning && e.pointerId === panning.pointerId) { panning = null; setPanningUi(false); return; }
       if (erasingPointer === e.pointerId) { erasingPointer = null; return; }
+      if (gesture && e.pointerId === gesture.pointerId) {
+        const g = gesture;
+        gesture = null;
+        layerDirty = true; // the dragged strokes were left out of the layer
+        if (g.kind === "move" && g.moved) performMove(g.ids, g.ids.map(() => newId()), g.dx, g.dy, "move");
+        schedule();
+        return;
+      }
       if (!drawing || e.pointerId !== drawing.pointerId) return;
       const p = point(e); // keep the final position
       if (drawing.kind === "pen") {
@@ -659,11 +920,20 @@ export default function Whiteboard(props: Props) {
       finish();
     };
     const onWheel = (e: WheelEvent) => {
-      e.preventDefault(); // zoom the board instead of scrolling the page
+      const action = wheelAction(e, curView.zoom);
+      if (action.kind === "none") return; // the whole board is visible: let the page scroll
+      e.preventDefault();
       const rect = canvas.getBoundingClientRect();
-      const [ax, ay] = toCanvasPointRaw(e.clientX, e.clientY, rect, curView);
-      const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * 100 : e.deltaY; // lines and pages to pixels
-      setView(zoomAt(curView, curView.zoom * Math.exp(-dy * 0.0015), [ax, ay]));
+      if (action.kind === "zoom") {
+        const [ax, ay] = toCanvasPointRaw(e.clientX, e.clientY, rect, curView);
+        setView(zoomAt(curView, curView.zoom * action.factor, [ax, ay]));
+      } else {
+        setView({
+          ...curView,
+          panX: curView.panX + (action.dx / rect.width) * (CANVAS_WIDTH / curView.zoom),
+          panY: curView.panY + (action.dy / rect.height) * (CANVAS_HEIGHT / curView.zoom),
+        });
+      }
     };
     canvas.addEventListener("pointerdown", onDown);
     canvas.addEventListener("pointermove", onMove);
@@ -674,19 +944,46 @@ export default function Whiteboard(props: Props) {
     const noMenu = (e: Event) => e.preventDefault(); // a long press must not open a menu and cancel the stroke
     canvas.addEventListener("contextmenu", noMenu);
 
+    const onKeyUp = (e: KeyboardEvent) => { if (e.code === "Space") spaceDown = false; };
+    const onBlurWindow = () => { spaceDown = false; };
     const onKey = (e: KeyboardEvent) => {
-      const t = e.target as HTMLElement | null;
-      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (e.code === "Space") {
+        if (tag === "BUTTON") return; // Space presses a focused button
+        spaceDown = true;
+        e.preventDefault(); // hold Space and drag to move the board
+        return;
+      }
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (selected.size > 0) { e.preventDefault(); apiRef.current.deleteSelection(); }
+        return;
+      }
+      if (e.key === "Escape") {
+        if (selected.size > 0) { selected.clear(); syncSel(); schedule(); }
+        return;
+      }
       if (!(e.ctrlKey || e.metaKey)) return;
       const k = e.key.toLowerCase();
+      if (k === "a" && toolRef.current === "hand" && joined && myRole !== "viewer") {
+        e.preventDefault();
+        for (const s of strokes) if (isSelectable(s)) selected.add(s.id);
+        syncSel();
+        schedule();
+        return;
+      }
       if (k === "z" && !e.shiftKey) { e.preventDefault(); apiRef.current.undo(); }
       else if ((k === "z" && e.shiftKey) || k === "y") { e.preventDefault(); apiRef.current.redo(); }
     };
     window.addEventListener("keydown", onKey);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlurWindow);
 
     return () => {
       disposed = true;
       window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlurWindow);
       canvas.removeEventListener("pointerdown", onDown);
       canvas.removeEventListener("pointermove", onMove);
       canvas.removeEventListener("pointerup", onUp);
@@ -713,12 +1010,29 @@ export default function Whiteboard(props: Props) {
       await navigator.clipboard.writeText(text);
       setNotice(done);
     } catch {
-      setNotice("Could not copy. Copy the address from the browser bar.");
+      // The clipboard only works on secure pages (https or localhost), so show the link to copy by hand.
+      window.prompt("Copy this link (Ctrl/Cmd+C):", text);
     }
   };
   const readOnly = role === "viewer";
+  const toolHint =
+    tool === "hand"
+      ? readOnly
+        ? view.zoom <= 1
+          ? "Zoom in (the + button, or Ctrl/Cmd + scroll), then drag to move around."
+          : "Drag to move around, or just scroll."
+        : "Click one of your strokes to select it and drag to move it. Drag empty space to select several (zoomed in, empty space moves the view and Shift+drag selects). Delete removes the selection. Holding Space moves the view with any tool."
+      : tool === "fill"
+        ? "Click inside a rectangle, an ellipse or a loop drawn with the pen to fill it. The fill stays with its shape when you move, erase or delete it."
+        : tool === "eraser"
+          ? "Drag over your own strokes to remove them."
+          : tool === "text"
+            ? "Click where the text should go, type, then press Enter."
+            : tool === "laser"
+              ? "Move the mouse over the board to point at things. You and everyone else see a red dot that fades when you stop."
+              : "";
   const tools = TOOLS.filter(([id]) => !readOnly || VIEWER_TOOLS.has(id));
-  const cursorClass = tool === "hand" ? "cursor-grab" : tool === "eraser" ? "cursor-cell" : tool === "text" ? "cursor-text" : "cursor-crosshair";
+  const cursorClass = tool === "hand" ? (panningUi ? "cursor-grabbing" : "cursor-grab") : tool === "fill" ? "cursor-pointer" : tool === "eraser" ? "cursor-cell" : tool === "text" ? "cursor-text" : "cursor-crosshair";
   const btn = "rounded border border-slate-300 bg-white px-3 py-1.5 text-sm hover:bg-slate-100 disabled:opacity-40";
 
   return (
@@ -753,7 +1067,12 @@ export default function Whiteboard(props: Props) {
         </div>
       </header>
 
-      <div className="flex flex-wrap items-center gap-3 rounded border border-slate-200 bg-white p-2">
+      <div
+        className="flex flex-wrap items-center gap-3 rounded border border-slate-200 bg-white p-2"
+        // A mouse click on a button must not leave it focused: Space, Delete and Ctrl+Z are shortcuts for the
+        // board and would otherwise be taken by the button. Keyboard users still tab to buttons as usual.
+        onMouseDown={(e) => { if ((e.target as HTMLElement).closest("button")) e.preventDefault(); }}
+      >
         <div role="group" aria-label="Tools" className="flex flex-wrap gap-1">
           {tools.map(([id, label]) => (
             <button
@@ -782,6 +1101,9 @@ export default function Whiteboard(props: Props) {
             </label>
             <button onClick={() => apiRef.current.undo()} disabled={!canUndo} className={btn}>Undo</button>
             <button onClick={() => apiRef.current.redo()} disabled={!canRedo} className={btn}>Redo</button>
+            {selCount > 0 && (
+              <button onClick={() => apiRef.current.deleteSelection()} className={btn}>Delete selection ({selCount})</button>
+            )}
           </>
         )}
         <div role="group" aria-label="Zoom" className="flex items-center gap-1">
@@ -835,6 +1157,9 @@ export default function Whiteboard(props: Props) {
           />
         )}
       </div>
+
+      {/* under the canvas, so showing or hiding it never moves the drawing area */}
+      <p role="note" className="min-h-10 text-sm text-slate-600">{toolHint}</p>
 
       <div className="flex flex-wrap items-center gap-2 text-sm">
         <span className="text-slate-600">On this board:</span>

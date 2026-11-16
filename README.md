@@ -55,9 +55,24 @@ For a production build: `npm run build && npm start`.
 Canvas 1600x900 logical units. At most 5000 points per stroke, 5000 strokes and 500,000 points per board, 200 points per progress batch, names 1 to 30 characters.
 
 ## Features
-Pen, eraser (your own strokes), line, arrow, rectangle, ellipse and text; undo and redo; zoom and pan; PNG and SVG export; laser pointer; named, coloured cursors; recent boards. The person who creates a board is its owner and can clear and rename it. Anyone with the board link can draw; a separate view-only link lets people watch and point with the laser without changing anything.
+Pen, eraser, fill, line, arrow, rectangle, ellipse and text; undo and redo; zoom and pan; PNG and SVG export; a laser pointer; named, coloured cursors; recent boards.
+
+- **Hand tool (select and move):** click one of your strokes to select it and drag to move it; drag empty space to select several; Delete removes the selection. When zoomed in, dragging empty space moves the view and Shift+drag selects. Holding Space moves the view with any tool.
+- **Zoom and scroll:** Ctrl or Cmd with the scroll wheel (or a trackpad pinch) zooms; a plain scroll moves the view when zoomed in.
+- **Fill:** click inside a rectangle, an ellipse or a closed pen loop. The fill belongs to its shape: it moves, undoes, deletes and erases with it.
+- **Laser:** you see your own red dot and everyone else sees it too; it fades when you stop moving.
+- **Owner and view-only:** the person who creates a board owns it and can clear and rename it. Anyone with the board link can draw. A separate view-only link lets people watch and point with the laser without changing anything.
 
 Extra environment variables for the socket server: `MAX_CONNECTIONS_PER_IP` (default 30), `TRUST_PROXY` (number of trusted proxies in front of the server, 0 by default, also read by the web app), `METRICS_TOKEN` (when set, `/metrics` needs `Authorization: Bearer <token>`).
+
+## Sharing with other people
+A link to `localhost` only works on your own computer. To let people on the same Wi-Fi or network join:
+```bash
+npm run share
+```
+This builds the app for your computer's network address, starts both servers on it and prints the address to open (for example `http://192.168.1.2:3400`). Open that address yourself (not localhost) so the links you copy are the right ones, then send people the board link from **Copy link**, or the **Copy view-only link** button. On a page without https the browser cannot copy automatically, so the link is shown in a box to copy by hand. People must be on the same network, and your computer may ask to allow incoming connections. Stop with Ctrl+C. The ports can be changed with `SHARE_WEB_PORT` and `SHARE_SOCKET_PORT`.
+
+Sharing over the internet needs the app deployed on a server with https (see Containers below), or a tunnel that exposes both the web port and the socket port. This was not tested.
 
 ## Containers
 `Dockerfile` has the targets `web`, `socket` and `migrate`; `docker-compose.yml` runs all of them with Postgres. See the comments at the top of both files. `.github/workflows/ci.yml` runs the checks.

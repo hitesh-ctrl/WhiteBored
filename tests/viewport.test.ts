@@ -32,3 +32,35 @@ describe("viewport", () => {
     expect(panBy({ zoom: 2, panX: 700, panY: 0 }, 1, 0).panX).toBe(800);
   });
 });
+
+import { wheelAction } from "../src/lib/viewport";
+
+describe("wheelAction", () => {
+  const base = { ctrlKey: false, metaKey: false, deltaX: 0, deltaY: 0, deltaMode: 0 };
+  it("zooms with Ctrl or Cmd held, which is also what a trackpad pinch sends, at any zoom level", () => {
+    for (const mod of [{ ctrlKey: true }, { metaKey: true }]) {
+      for (const zoom of [1, 3]) {
+        const a = wheelAction({ ...base, ...mod, deltaY: -100 }, zoom);
+        expect(a.kind).toBe("zoom");
+        expect((a as { factor: number }).factor).toBeCloseTo(Math.exp(0.15));
+      }
+    }
+    expect((wheelAction({ ...base, ctrlKey: true, deltaY: 100 }, 1) as { factor: number }).factor).toBeLessThan(1);
+  });
+  it("pans with a plain wheel or two-finger scroll when zoomed in", () => {
+    expect(wheelAction({ ...base, deltaX: 30, deltaY: -40 }, 2)).toEqual({ kind: "pan", dx: 30, dy: -40 });
+  });
+  it("does nothing, and so lets the page scroll, when the whole board is visible", () => {
+    expect(wheelAction({ ...base, deltaY: 100 }, 1)).toEqual({ kind: "none" });
+  });
+  it("turns line and page scrolling (Firefox) into pixels", () => {
+    expect(wheelAction({ ...base, deltaY: 3, deltaMode: 1 }, 2)).toEqual({ kind: "pan", dx: 0, dy: 48 });
+    expect(wheelAction({ ...base, deltaY: 1, deltaMode: 2 }, 2)).toEqual({ kind: "pan", dx: 0, dy: 100 });
+    expect((wheelAction({ ...base, ctrlKey: true, deltaY: 3, deltaMode: 1 }, 1) as { factor: number }).factor).toBeCloseTo(Math.exp(-48 * 0.0015));
+  });
+  it("never produces NaN or infinite values", () => {
+    const a = wheelAction({ ...base, ctrlKey: true, deltaY: 1e9 }, 1) as { factor: number };
+    expect(Number.isFinite(a.factor)).toBe(true);
+    expect(a.factor).toBeGreaterThan(0);
+  });
+});

@@ -23,6 +23,38 @@ describe("stroke kinds", () => {
     expect(late.ack.strokes.find((x: any) => x.id === s.id)).toMatchObject({ kind, points: s.points });
   });
 
+  it("accepts a fill polygon, relays it and replays it, and the author can remove it like any stroke", async () => {
+    const board = await createBoard(srv.prisma);
+    const a = await joinAs(srv, board.id, "Ann");
+    const b = await joinAs(srv, board.id, "Bob");
+    const f = stroke({ kind: "fill", width: 1, color: "#ffcc00", points: [[0, 0], [100, 0], [100, 100], [0, 100]] });
+    const relayed = waitFor(b.socket, "stroke:commit");
+    expect(await emitAck(a.socket, "stroke:commit", f)).toEqual({ ok: true });
+    expect(await relayed).toMatchObject({ kind: "fill", points: f.points, color: "#ffcc00" });
+    expect((await srv.prisma.stroke.findUniqueOrThrow({ where: { id: f.id } })).pointCount).toBe(4);
+    const late = await joinAs(srv, board.id, "Late");
+    expect(late.ack.strokes[0]).toMatchObject({ kind: "fill", points: f.points });
+    expect(await emitAck(b.socket, "stroke:undo", { id: f.id })).toEqual({ ok: false, error: "forbidden" });
+    expect(await emitAck(a.socket, "stroke:undo", { id: f.id })).toEqual({ ok: true });
+  });
+
+  it("a fill can name the shape it fills, and that link is stored, relayed and replayed", async () => {
+    const board = await createBoard(srv.prisma);
+    const a = await joinAs(srv, board.id, "Ann");
+    const b = await joinAs(srv, board.id, "Bob");
+    const rect = shape("rect");
+    const fill = stroke({ kind: "fill", width: 1, containerId: rect.id, points: [[100, 100], [300, 100], [300, 200], [100, 200]] });
+    await emitAck(a.socket, "stroke:commit", rect);
+    await sleep(200); // let the rectangle's relay reach Bob first, so the next event is the fill's
+    const relayed = waitFor(b.socket, "stroke:commit");
+    expect(await emitAck(a.socket, "stroke:commit", fill)).toEqual({ ok: true });
+    expect(await relayed).toMatchObject({ kind: "fill", containerId: rect.id });
+    expect((await srv.prisma.stroke.findUniqueOrThrow({ where: { id: fill.id } })).containerId).toBe(rect.id);
+    const late = await joinAs(srv, board.id, "Late");
+    expect(late.ack.strokes.find((x: any) => x.id === fill.id)).toMatchObject({ containerId: rect.id });
+    expect(late.ack.strokes.find((x: any) => x.id === rect.id).containerId).toBeUndefined();
+  });
+
   it("accepts text with its content and replays it", async () => {
     const board = await createBoard(srv.prisma);
     const a = await joinAs(srv, board.id, "Ann");
@@ -56,6 +88,13 @@ describe("stroke kinds", () => {
     ["text on a pen stroke", stroke({ text: "nope" })],
     ["text on a shape", shape("rect", { text: "nope" })],
     ["unknown kind", shape("polygon")],
+    ["a container id on a rectangle", shape("rect", { containerId: uuid() })],
+    ["a container id on a pen stroke", stroke({ containerId: uuid() })],
+    ["a container id on text", textStroke({ containerId: uuid() })],
+    ["a fill whose container id is not a uuid", stroke({ kind: "fill", containerId: "nope", points: [[0, 0], [1, 0], [1, 1]] })],
+    ["fill with two points", stroke({ kind: "fill", points: [[1, 1], [2, 2]] })],
+    ["fill with one point", stroke({ kind: "fill", points: [[1, 1]] })],
+    ["fill with text", stroke({ kind: "fill", text: "no", points: [[0, 0], [1, 0], [1, 1]] })],
     ["kind of the wrong type", shape("rect", { kind: 5 })],
   ];
   it.each(bad)("rejects %s", async (_n, payload) => {
@@ -80,6 +119,8 @@ describe("stroke kinds", () => {
     expect(await got).toMatchObject({ kind: "rect", points: [[100, 100], [300, 200]] });
     const none = record(b.socket, ["stroke:progress"]);
     a.socket.emit("stroke:progress", textStroke());
+    a.socket.emit("stroke:progress", stroke({ kind: "fill", points: [[0, 0], [1, 0], [1, 1]] }));
+    a.socket.emit("stroke:progress", shape("rect", { containerId: uuid() }));
     a.socket.emit("stroke:progress", shape("line", { points: [[1, 1], [2, 2], [3, 3]] }));
     await sleep(300);
     expect(none).toEqual([]);

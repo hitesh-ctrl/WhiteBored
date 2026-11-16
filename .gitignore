@@ -10,3 +10,5 @@ src/generated/
 *.tsbuildinfo
 next-env.d.ts
 test-results/
+.next-share/
+.next-e2e/

@@ -174,7 +174,9 @@ await check("text typed into the box is kept when focus moves to a colour button
   await pick(A, "Text");
   await A.mouse.click(box.x + box.width * 0.1, box.y + box.height * 0.72);
   await A.getByLabel("Text to place on the board").fill("kept on blur");
-  await A.getByRole("button", { name: "Blue", exact: true }).click();
+  await A.getByRole("button", { name: "Blue", exact: true }).click(); // picking a colour keeps the box open
+  if ((await A.getByLabel("Text to place on the board").count()) !== 1) throw new Error("the text box closed when a colour was picked");
+  await A.locator("h1").click(); // clicking elsewhere moves focus away, which keeps what was typed
   await waitUntil(async () => (await ink(B)) > before + 100, 5000, "blur text visible in B");
   if (!(await prisma.stroke.findFirst({ where: { boardId, kind: "text", text: "kept on blur" } }))) throw new Error("not stored");
   await A.getByRole("button", { name: "Black", exact: true }).click();
@@ -186,8 +188,7 @@ await check("an empty text box that loses focus creates nothing", async () => {
   await pick(A, "Text");
   await A.mouse.click(box.x + box.width * 0.6, box.y + box.height * 0.9);
   await A.getByLabel("Text to place on the board").waitFor({ timeout: 3000 });
-  await A.getByRole("button", { name: "Red", exact: true }).click();
-  await A.getByRole("button", { name: "Black", exact: true }).click();
+  await A.locator("h1").click(); // focus leaves the empty box
   await sleep(500);
   if ((await prisma.stroke.count({ where: { boardId } })) !== n) throw new Error("an empty text stroke was created");
   await pick(A, "Pen");
@@ -210,17 +211,22 @@ await check("zoom and pan: buttons, wheel, hand tool, and drawing lands on the r
   if ((await zoomLabel(A)) !== "125%") throw new Error(await zoomLabel(A));
   const box = (await A.locator("canvas").boundingBox())!;
   await A.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  await A.mouse.wheel(0, -400);
+  await A.keyboard.down("Control"); await A.mouse.wheel(0, -400); await A.keyboard.up("Control"); // Ctrl or Cmd with the wheel (or a trackpad pinch) zooms
   await waitUntil(async () => parseInt(await zoomLabel(A)) > 125, 3000, "wheel zoom");
+  const z2 = parseInt(await zoomLabel(A));
+  await A.mouse.wheel(0, 100); // a plain scroll moves the view when zoomed in and must not change the zoom
+  await sleep(200);
+  if (parseInt(await zoomLabel(A)) !== z2) throw new Error("a plain scroll changed the zoom");
   await A.getByRole("button", { name: "Reset zoom" }).click();
   if ((await zoomLabel(A)) !== "100%") throw new Error("reset failed");
   for (let i = 0; i < 4; i++) await A.getByRole("button", { name: "Zoom in" }).click();
   const Z = Math.pow(1.25, 4);
   if ((await zoomLabel(A)) !== `${Math.round(Z * 100)}%`) throw new Error(await zoomLabel(A));
-  // pan with the hand tool by 100 screen pixels to the left
-  await pick(A, "Hand");
+  // hold Space and drag by 100 screen pixels to the left (works with any tool, whatever is under the pointer)
   const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
+  await A.keyboard.down("Space");
   await A.mouse.move(cx, cy); await A.mouse.down(); await A.mouse.move(cx - 100, cy, { steps: 5 }); await A.mouse.up();
+  await A.keyboard.up("Space");
   // draw a short mark at the screen centre; the expected canvas position follows from the pan
   await pick(A, "Pen");
   await stroke(A, [0.5, 0.5], [0.5, 0.5]);
@@ -293,6 +299,131 @@ await check("view-only visitor: sees the board, has no editing controls, cannot 
   if (r?.status() !== 404) throw new Error(`edit id as view id gave ${r?.status()}`);
 });
 
+/* ---------- Hand tool (select and move), bound fills, own laser: a fresh board ---------- */
+const { p: C } = await mk();
+const { p: D } = await mk(1000, 700);
+C.on("dialog", (d) => void d.accept());
+C.on("pageerror", (e) => errors.push(`C: ${e.message}`));
+D.on("pageerror", (e) => errors.push(`D: ${e.message}`));
+await C.goto(WEB);
+await C.fill("#name", "Hand and fill");
+await C.click("text=Create board");
+await C.waitForURL(/\/board\/[0-9a-f-]{36}/);
+const board2Url = C.url().split("#")[0];
+const board2 = board2Url.split("/").pop()!;
+await enterName(C, "Cara");
+await D.goto(board2Url);
+await enterName(D, "Dan");
+const cbox = (await C.locator("canvas").boundingBox())!;
+const cat = (fx: number, fy: number) => [cbox.x + cbox.width * fx, cbox.y + cbox.height * fy] as const;
+const alpha = (page: Page, x: number, y: number) => page.evaluate(`document.querySelector("canvas").getContext("2d").getImageData(${x},${y},1,1).data[3]`) as Promise<number>;
+const rows2 = () => prisma.stroke.findMany({ where: { boardId: board2 }, orderBy: { seq: "asc" }, select: { id: true, kind: true, containerId: true, color: true, authorId: true } });
+const dots = (page: Page) => page.evaluate(`[...document.querySelectorAll("[aria-hidden=true] div")].filter((d) => d.firstElementChild && d.firstElementChild.style.boxShadow).map((d) => d.textContent + ":" + d.style.display)`) as Promise<string[]>;
+
+await check("Hand tool at 100% zoom: click selects, drag moves (for both people), Ctrl+Z moves it back", async () => {
+  await stroke(C, [0.1, 0.2], [0.3, 0.2]);
+  await stroke(C, [0.1, 0.5], [0.3, 0.5]);
+  await waitUntil(async () => (await ink(D)) === (await ink(C)) && (await ink(C)) > 100, 5000, "strokes in D");
+  await pick(C, "Hand");
+  if ((await zoomLabel(C)) !== "100%") throw new Error("zoom is not 100%");
+  const [x0, y0] = cat(0.2, 0.2), [x1, y1] = cat(0.2, 0.35);
+  await C.mouse.move(x0, y0); await C.mouse.down(); await C.mouse.move(x0, (y0 + y1) / 2, { steps: 4 }); await C.mouse.move(x1, y1, { steps: 4 }); await C.mouse.up();
+  await waitUntil(async () => (await alpha(C, 320, 315)) > 0 && (await alpha(C, 320, 180)) === 0 && (await alpha(D, 320, 315)) > 0 && (await alpha(D, 320, 180)) === 0, 5000, "moved in C and D");
+  if ((await rows2()).length !== 2) throw new Error("the old row was not replaced");
+  await C.keyboard.press("Control+z");
+  await waitUntil(async () => (await alpha(C, 320, 180)) > 0 && (await alpha(D, 320, 180)) > 0 && (await alpha(D, 320, 315)) === 0, 5000, "moved back");
+  await shot(C, "f08-hand-move");
+});
+await check("Hand tool: box-select several, move them together, Delete removes them; others' strokes cannot be moved", async () => {
+  const [bx0, by0] = cat(0.02, 0.1), [bx1, by1] = cat(0.45, 0.6);
+  await C.mouse.move(bx0, by0); await C.mouse.down(); await C.mouse.move(bx1, by1, { steps: 6 }); await C.mouse.up();
+  await C.getByRole("button", { name: /Delete selection \(2\)/ }).waitFor({ timeout: 3000 });
+  const [mx, my] = cat(0.2, 0.5);
+  await C.mouse.move(mx, my); await C.mouse.down(); await C.mouse.move(mx + 200, my, { steps: 6 }); await C.mouse.up();
+  const px = Math.round(300 + (200 / cbox.width) * 1600);
+  await waitUntil(async () => (await alpha(D, px, 180)) > 0 && (await alpha(D, px, 450)) > 0 && (await alpha(D, 170, 180)) === 0, 5000, "both moved in D");
+  await pick(D, "Hand");
+  const dbox = (await D.locator("canvas").boundingBox())!;
+  const before = await ink(C);
+  await D.mouse.move(dbox.x + dbox.width * 0.5, dbox.y + dbox.height * 0.2); await D.mouse.down(); await D.mouse.move(dbox.x + dbox.width * 0.5, dbox.y + dbox.height * 0.5, { steps: 5 }); await D.mouse.up();
+  await sleep(600);
+  if ((await ink(C)) !== before || (await rows2()).length !== 2) throw new Error("Dan moved Cara's stroke");
+  await C.mouse.move(...cat(0.1, 0.05)); await C.mouse.down(); await C.mouse.move(...cat(0.7, 0.75), { steps: 6 }); await C.mouse.up();
+  await C.keyboard.press("Delete");
+  await waitUntil(async () => (await rows2()).length === 0, 5000, "deleted");
+});
+await check("Hand tool when zoomed in: dragging empty space moves the view, a plain scroll moves it too", async () => {
+  await pick(C, "Pen");
+  await stroke(C, [0.45, 0.8], [0.55, 0.8]);
+  await pick(C, "Hand");
+  await C.getByRole("button", { name: "Zoom in" }).click(); await C.getByRole("button", { name: "Zoom in" }).click();
+  await sleep(400);
+  const minX = () => C.evaluate(`(() => { const c = document.querySelector("canvas"); const w = c.width, h = c.height; const d = c.getContext("2d").getImageData(0, 0, w, h).data; let m = w; for (let y = 0; y < h; y++) for (let x = 0; x < m; x++) if (d[(y * w + x) * 4 + 3] > 0) { m = x; break; } return m; })()`) as Promise<number>;
+  const m0 = await minX();
+  const [px, py] = cat(0.7, 0.3);
+  await C.mouse.move(px, py); await C.mouse.down(); await C.mouse.move(px - 150, py, { steps: 5 }); await C.mouse.up();
+  await sleep(300);
+  const m1 = await minX();
+  const expected = (150 / cbox.width) * 1600;
+  if (Math.abs(m0 - m1 - expected) > 12) throw new Error(`left edge ${m0} to ${m1}, expected a shift of about ${Math.round(expected)}`);
+  await C.mouse.move(...cat(0.5, 0.5));
+  await C.mouse.wheel(60, 0);
+  await sleep(300);
+  if ((await minX()) >= m1) throw new Error("a plain scroll did not move the view");
+  await C.getByRole("button", { name: "Reset zoom" }).click();
+  await C.keyboard.press("Control+a"); await C.keyboard.press("Delete");
+  await waitUntil(async () => (await rows2()).length === 0, 5000, "cleared");
+});
+await check("a fill belongs to its shape: it moves, undoes, deletes and erases with it, and a new colour replaces the old one", async () => {
+  await pick(C, "Rectangle"); await stroke(C, [0.2, 0.2], [0.5, 0.5]);
+  await C.getByRole("button", { name: "Red", exact: true }).click();
+  await pick(C, "Fill"); await C.mouse.click(...cat(0.35, 0.35));
+  await waitUntil(async () => (await rows2()).length === 2, 4000, "shape and fill stored");
+  let r = await rows2();
+  if (r[1].kind !== "fill" || r[1].containerId !== r[0].id) throw new Error("the fill does not name its shape");
+  await pick(C, "Hand");
+  const [sx, sy] = cat(0.35, 0.35); // inside the colour, not on the outline
+  await C.mouse.move(sx, sy); await C.mouse.down(); await C.mouse.move(sx + 100, sy + 50, { steps: 5 }); await C.mouse.move(sx + 200, sy + 100, { steps: 5 }); await C.mouse.up();
+  const dxC = Math.round((200 / cbox.width) * 1600), dyC = Math.round((100 / cbox.height) * 900);
+  await waitUntil(async () => (await alpha(D, 560 + dxC, 315 + dyC)) > 0 && (await alpha(D, 560, 315)) === 0 && (await alpha(C, 560, 315)) === 0, 6000, "shape and fill moved for both");
+  r = await rows2();
+  if (r.find((x) => x.kind === "fill")!.containerId !== r.find((x) => x.kind === "rect")!.id) throw new Error("the moved fill does not name the moved shape");
+  await shot(C, "f09-fill-moved-with-shape");
+  await C.keyboard.press("Control+z");
+  await waitUntil(async () => (await alpha(D, 560, 315)) > 0 && (await alpha(D, 560 + dxC, 315 + dyC)) === 0, 6000, "moved back together");
+  await C.getByRole("button", { name: "Blue", exact: true }).click();
+  await pick(C, "Fill"); await C.mouse.click(...cat(0.35, 0.35));
+  await waitUntil(async () => { const x = await rows2(); return x.filter((y) => y.kind === "fill").length === 1 && x.find((y) => y.kind === "fill")!.color === "#2563eb"; }, 5000, "fill replaced, not stacked");
+  await pick(C, "Hand"); await C.mouse.click(...cat(0.35, 0.35));
+  await C.getByRole("button", { name: /Delete selection \(2\)/ }).waitFor({ timeout: 3000 });
+  await C.keyboard.press("Delete");
+  await waitUntil(async () => (await rows2()).length === 0, 5000, "shape and fill deleted");
+  await pick(C, "Rectangle"); await stroke(C, [0.2, 0.2], [0.5, 0.5]);
+  await pick(C, "Fill"); await C.mouse.click(...cat(0.35, 0.35));
+  await waitUntil(async () => (await rows2()).length === 2, 4000, "again");
+  await pick(C, "Eraser"); await stroke(C, [0.2, 0.2], [0.5, 0.2]);
+  await waitUntil(async () => (await rows2()).length === 0, 5000, "erasing the outline took the fill too");
+});
+await check("laser: you see your own dot (the server never echoes), the other person sees yours, and it fades", async () => {
+  await pick(C, "Laser");
+  await C.mouse.move(...cat(0.6, 0.6)); await C.mouse.move(...cat(0.65, 0.65), { steps: 4 });
+  await waitUntil(async () => (await dots(C)).some((d) => d.startsWith("You") && !d.endsWith("none")), 3000, "own dot");
+  await waitUntil(async () => (await dots(D)).some((d) => d.startsWith("Cara") && !d.endsWith("none")), 3000, "dot in D");
+  await sleep(2000);
+  if ((await dots(C)).length !== 0) throw new Error("the dot did not fade");
+  await shot(C, "f10-laser-own-dot");
+});
+await check("keyboard shortcuts work right after clicking a tool button (Space, Delete, Ctrl+Z are not swallowed by the button)", async () => {
+  await pick(C, "Pen"); await stroke(C, [0.1, 0.8], [0.3, 0.8]);
+  await waitUntil(async () => (await rows2()).length === 1, 4000, "stroke");
+  await C.getByRole("button", { name: "Undo" }).click();
+  await waitUntil(async () => (await rows2()).length === 0, 4000, "undo by button");
+  await C.getByRole("button", { name: "Redo" }).click();
+  await waitUntil(async () => (await rows2()).length === 1, 4000, "redo by button");
+  await C.keyboard.press("Control+z"); // focus must not be stuck on the Redo button
+  await waitUntil(async () => (await rows2()).length === 0, 4000, "Ctrl+Z after clicking a button");
+});
+
 await check("metrics are served and have counted this session", async () => {
   const text = await (await fetch(`${SOCKET}/metrics`)).text();
   const num = (n: string) => Number(new RegExp(`^${n} (\\d+)$`, "m").exec(text)?.[1] ?? NaN);
@@ -305,7 +436,7 @@ await check("no uncaught page errors and no CSP violations", async () => {
 
 await browser.close();
 socket.kill("SIGTERM"); web.kill("SIGTERM");
-await prisma.board.deleteMany({ where: { id: boardId } });
+await prisma.board.deleteMany({ where: { id: { in: [boardId, board2] } } });
 await prisma.$disconnect();
 writeFileSync("logs/evidence/e2e-features-results.json", JSON.stringify(results, null, 2));
 const failed = results.filter((r) => !r.pass).length;

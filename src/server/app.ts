@@ -1,13 +1,14 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { clientAddress, trustHops } from "../lib/proxy";
+import { clampDelta, pointsBounds, translatePoints } from "../shared/move";
 import { Server, type Socket } from "socket.io";
 import type { PrismaClient } from "../generated/prisma/client";
 import {
   MAX_CONNECTIONS_PER_IP, MAX_MESSAGE_BYTES, MAX_POINTS_PER_BOARD, MAX_STROKES_PER_BOARD,
 } from "../shared/limits";
 import {
-  commitSchema, cursorSchema, joinSchema, progressSchema, renameSchema, roomOf, undoSchema,
+  commitSchema, cursorSchema, joinSchema, moveSchema, progressSchema, renameSchema, roomOf, undoSchema,
   type ClientToServerEvents, type ErrorCode, type JoinAck, type Role, type ServerToClientEvents,
   type Point, type SocketData, type Stroke, type User,
 } from "../shared/protocol";
@@ -33,6 +34,15 @@ export interface WhiteboardServerOptions {
 }
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest();
+
+type StrokeRow = { id: string; authorId: string; color: string; width: number; kind: string; points: unknown; text: string | null; containerId?: string | null };
+const toStroke = (r: StrokeRow): Stroke => ({
+  id: r.id, authorId: r.authorId, color: r.color, width: r.width,
+  kind: r.kind as Stroke["kind"],
+  points: r.points as Stroke["points"],
+  ...(r.text ? { text: r.text } : {}),
+  ...(r.containerId ? { containerId: r.containerId } : {}),
+});
 const round1 = (n: number) => Math.round(n * 10) / 10;
 const roundPoints = (points: Point[]): Point[] => points.map(([x, y]) => [round1(x), round1(y)]);
 
@@ -247,12 +257,7 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
           socket.to(room).emit("user:joined", { id: clientId, name });
         }
 
-        const strokes: Stroke[] = rows.map((r) => ({
-          id: r.id, authorId: r.authorId, color: r.color, width: r.width,
-          kind: r.kind as Stroke["kind"],
-          points: r.points as Stroke["points"],
-          ...(r.text ? { text: r.text } : {}),
-        }));
+        const strokes: Stroke[] = rows.map(toStroke);
         const reply: JoinAck = {
           ok: true, strokes, users: usersOf(boardId), role, canClear, boardName: board.name,
           ...(role === "viewer" ? {} : { viewId: board.viewId }),
@@ -309,7 +314,7 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
           const res = await tx.stroke.createMany({
             data: [{
               id: s.id, boardId: c.boardId, authorId: c.clientId, authorProof: c.proof, color: s.color, width: s.width,
-              kind: s.kind, text: s.text ?? null, points: s.points, pointCount: s.points.length,
+              kind: s.kind, text: s.text ?? null, containerId: s.containerId ?? null, points: s.points, pointCount: s.points.length,
             }],
             skipDuplicates: true,
           });
@@ -342,6 +347,55 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
         if (res.count === 0) return fail(ack, "forbidden");
         socket.to(c.room).emit("stroke:remove", { id: parsed.data.id });
         done(ack);
+      });
+    });
+
+    on("stroke:move", "mutate", async (raw, ack) => {
+      const c = ctx();
+      if (!c) return fail(ack, "not_joined");
+      if (c.role === "viewer") return fail(ack, "forbidden");
+      const parsed = moveSchema.safeParse(raw);
+      if (!parsed.success) return fail(ack, "invalid");
+      const { moves, dx, dy } = parsed.data;
+      const oldIds = moves.map((m) => m.id), newIds = moves.map((m) => m.newId);
+
+      await inBoardOrder(c.boardId, async () => {
+        const result = await prisma.$transaction(async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${c.boardId}, 0))`;
+          const mine = { boardId: c.boardId, authorId: c.clientId, OR: [{ authorProof: c.proof }, { authorProof: null }] };
+
+          // A repeated request (the first ack was lost): the new strokes already exist and are ours.
+          const already = await tx.stroke.findMany({ where: { id: { in: newIds } }, orderBy: { seq: "asc" } });
+          if (already.length > 0) {
+            const ours = await tx.stroke.count({ where: { id: { in: newIds }, ...mine } });
+            return ours === newIds.length ? { kind: "again" as const, added: already.map(toStroke) } : { kind: "forbidden" as const };
+          }
+
+          // Every stroke must be the caller's own, or nothing moves at all.
+          const olds = await tx.stroke.findMany({ where: { id: { in: oldIds }, ...mine } });
+          if (olds.length !== oldIds.length) return { kind: "forbidden" as const };
+          const byId = new Map(olds.map((r) => [r.id, r]));
+          const ordered = moves.map((m) => ({ newId: m.newId, row: byId.get(m.id)! }));
+          // A fill names the shape it fills. If that shape moves in the same request the fill follows
+          // it (its copy points at the shape's new id); otherwise the fill is no longer bound to it.
+          const renumbered = new Map(moves.map((m) => [m.id, m.newId]));
+
+          const shift = clampDelta(pointsBounds(ordered.flatMap(({ row }) => row.points as Point[])), dx, dy);
+          const data = ordered.map(({ newId, row }) => ({
+            id: newId, boardId: c.boardId, authorId: row.authorId, authorProof: row.authorProof,
+            kind: row.kind, text: row.text, color: row.color, width: row.width,
+            containerId: row.containerId ? (renumbered.get(row.containerId) ?? null) : null,
+            points: translatePoints(row.points as Point[], shift.dx, shift.dy), pointCount: row.pointCount,
+          }));
+          // Append-only in spirit: the old rows go and translated copies are added, in one step.
+          await tx.stroke.deleteMany({ where: { id: { in: oldIds } } });
+          await tx.stroke.createMany({ data });
+          return { kind: "moved" as const, added: data.map((d) => toStroke(d)) };
+        });
+
+        if (result.kind === "forbidden") return fail(ack, "forbidden");
+        if (result.kind === "moved") socket.to(c.room).emit("stroke:moved", { removed: oldIds, added: result.added });
+        ack?.({ ok: true, strokes: result.added } as never);
       });
     });
 

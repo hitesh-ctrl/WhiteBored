@@ -9,6 +9,7 @@ export const MAX_WIDTH = 40;
 export const MAX_NAME_LENGTH = 30;
 export const MAX_MESSAGE_BYTES = 256 * 1024;
 export const MAX_TEXT_LENGTH = 200;
+export const MAX_MOVE_STROKES = 100;
 export const MAX_CONNECTIONS_PER_IP = 30;
 export const BOARD_CREATES_PER_MINUTE = 5;
 /** Font size in canvas units for a text stroke, derived from its width setting. */

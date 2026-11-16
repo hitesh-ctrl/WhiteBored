@@ -1,5 +1,6 @@
 import { fontSizeFor } from "../shared/limits";
 import type { Point } from "./drawing";
+import { pointInPolygon } from "./fill";
 
 export type Shape = { kind: string; width: number; points: Point[]; text?: string | null };
 type Box = { x: number; y: number; w: number; h: number };
@@ -36,6 +37,8 @@ function cornerBox(s: Shape) {
 export function strokeHit(s: Shape, p: Point, radius: number): boolean {
   const reach = radius + s.width / 2;
   switch (s.kind) {
+    case "fill":
+      return pointInPolygon(p, s.points);
     case "text": {
       const b = textBox(s);
       return p[0] >= b.x - radius && p[0] <= b.x + b.w + radius && p[1] >= b.y - radius && p[1] <= b.y + b.h + radius;

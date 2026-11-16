@@ -1,5 +1,6 @@
 import { CANVAS_HEIGHT, CANVAS_WIDTH, fontSizeFor } from "../shared/limits";
 import type { Point } from "./drawing";
+import { renderOrder } from "./render";
 
 export type ExportStroke = { id?: string; authorId?: string; kind: string; color: string; width: number; points: Point[]; text?: string | null };
 
@@ -13,6 +14,8 @@ function element(s: ExportStroke): string {
   const line = `fill="none" stroke="${color}" stroke-width="${n(s.width)}" stroke-linecap="round" stroke-linejoin="round"`;
   const [a, b] = s.points;
   switch (s.kind) {
+    case "fill":
+      return `<polygon points="${s.points.map((p) => `${n(p[0])},${n(p[1])}`).join(" ")}" fill="${color}"/>`;
     case "text": {
       const size = fontSizeFor(s.width);
       return `<text x="${n(a[0])}" y="${n(a[1] + size)}" font-size="${size}" font-family="sans-serif" fill="${color}">${esc(s.text ?? "")}</text>`;
@@ -46,7 +49,7 @@ export function strokesToSvg(strokes: ExportStroke[]): string {
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" width="${CANVAS_WIDTH}" height="${CANVAS_HEIGHT}" viewBox="0 0 ${CANVAS_WIDTH} ${CANVAS_HEIGHT}">` +
     `<rect width="${CANVAS_WIDTH}" height="${CANVAS_HEIGHT}" fill="#ffffff"/>` +
-    strokes.map(element).join("") +
+    renderOrder(strokes).map(element).join("") +
     `</svg>`
   );
 }
