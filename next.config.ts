@@ -21,6 +21,7 @@ const csp = [
 
 const config: NextConfig = {
   poweredByHeader: false,
+  agentRules: false,
   async headers() {
     return [
       {
