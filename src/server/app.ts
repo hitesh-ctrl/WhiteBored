@@ -204,10 +204,6 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
         const canClear = role === "owner" || (role === "editor" && board.ownerHash === null);
         const boardId = board.id;
         const room = roomOf(boardId);
-        // A client id is public (it is in every stroke), so it only counts as one person while
-        // the same secret key is shown. A different key under a present id is somebody else.
-        const present = presence.get(boardId)?.get(clientId);
-        if (present && present.proof !== proof) return fail(ack, "forbidden");
 
         // Join the room before reading history so no live event can fall between the two.
         await socket.join(room);
@@ -224,9 +220,12 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
           await socket.leave(room);
           return;
         }
-        const racing = presence.get(boardId)?.get(clientId);
-        if (racing && racing.proof !== proof) {
-          await socket.leave(room); // another join with this id finished while we were reading
+        // A client id is public (it is in every stroke), so it only counts as one person while the
+        // same secret key is shown. A different key under a present id is somebody else. This check
+        // sits right before presence is written, with no await in between, so two joins cannot slip past it.
+        const present = presence.get(boardId)?.get(clientId);
+        if (present && present.proof !== proof) {
+          await socket.leave(room);
           return fail(ack, "forbidden");
         }
         socket.data.boardId = boardId;
