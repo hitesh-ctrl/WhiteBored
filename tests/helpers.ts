@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { io as ioc, type Socket } from "socket.io-client";
@@ -18,12 +18,12 @@ export type TestServer = {
   prisma: PrismaClient;
   close(): Promise<void>;
   sockets: Socket[];
-  connect(): Promise<Socket>;
+  connect(extraHeaders?: Record<string, string>): Promise<Socket>;
 };
 
-export async function startTestServer(): Promise<TestServer> {
+export async function startTestServer(opts: { maxConnectionsPerIp?: number; trustProxy?: boolean } = {}): Promise<TestServer> {
   const prisma = makePrisma();
-  const { httpServer, io } = createWhiteboardServer({ prisma, corsOrigin: ORIGIN });
+  const { httpServer, io } = createWhiteboardServer({ prisma, corsOrigin: ORIGIN, ...opts });
   await new Promise<void>((r) => httpServer.listen(0, "127.0.0.1", r));
   const port = (httpServer.address() as AddressInfo).port;
   const url = `http://127.0.0.1:${port}`;
@@ -32,8 +32,8 @@ export async function startTestServer(): Promise<TestServer> {
     url,
     prisma,
     sockets,
-    async connect() {
-      const s = ioc(url, { transports: ["websocket"], forceNew: true, reconnection: false });
+    async connect(extraHeaders: Record<string, string> = {}) {
+      const s = ioc(url, { transports: ["websocket"], forceNew: true, reconnection: false, extraHeaders });
       sockets.push(s);
       await new Promise<void>((res, rej) => {
         s.once("connect", () => res());
@@ -96,4 +96,20 @@ export async function joinAs(srv: TestServer, boardId: string, name: string, cli
   const socket = await srv.connect();
   const ack = await emitAck(socket, "board:join", { boardId, clientId, name });
   return { socket, ack, clientId };
+}
+
+export const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+
+/** A board with an owner: returns the secret key, only its hash is stored. */
+export async function createOwnedBoard(prisma: PrismaClient, name = "owned board") {
+  const ownerKey = randomBytes(24).toString("base64url");
+  const board = await prisma.board.create({ data: { name, ownerHash: sha256(ownerKey) } });
+  return { board, ownerKey };
+}
+
+/** Join with an arbitrary payload (view-only, owner key, invalid shapes). */
+export async function joinWith(srv: TestServer, payload: unknown, extraHeaders?: Record<string, string>) {
+  const socket = await srv.connect(extraHeaders);
+  const ack = await emitAck(socket, "board:join", payload);
+  return { socket, ack };
 }

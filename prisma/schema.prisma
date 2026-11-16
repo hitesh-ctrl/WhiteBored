@@ -10,6 +10,10 @@ datasource db {
 model Board {
   id        String   @id @default(uuid()) @db.Uuid
   name      String
+  /// Separate id for the view-only link, so it does not reveal the edit link.
+  viewId    String   @unique @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// SHA-256 hex of the owner key. Null for boards created before owners existed.
+  ownerHash String?
   createdAt DateTime @default(now())
   strokes   Stroke[]
 }
@@ -20,6 +24,8 @@ model Stroke {
   boardId    String   @db.Uuid
   board      Board    @relation(fields: [boardId], references: [id], onDelete: Cascade)
   authorId   String   @db.Uuid
+  kind       String   @default("pen")
+  text       String?
   color      String
   width      Int
   points     Json
