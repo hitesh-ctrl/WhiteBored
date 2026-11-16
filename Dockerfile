@@ -11,7 +11,8 @@ RUN npm ci --ignore-scripts
 
 FROM deps AS build
 COPY . .
-# The browser reads this at build time, and the page security policy reads it at start.
+# Baked into the browser bundle at build time. The web image keeps it in its environment, so
+# the page security policy (computed when the server starts) uses the same value.
 ARG NEXT_PUBLIC_SOCKET_URL=http://localhost:4000
 ENV NEXT_PUBLIC_SOCKET_URL=$NEXT_PUBLIC_SOCKET_URL
 RUN npx prisma generate && npx next build
@@ -25,6 +26,7 @@ ENV NODE_ENV=production
 RUN chown -R node:node /app/.next
 USER node
 EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://127.0.0.1:3000/ >/dev/null || exit 1
 CMD ["npx", "next", "start", "-p", "3000"]
 
 FROM base AS prod-deps
@@ -35,9 +37,12 @@ FROM base AS socket
 ENV NODE_ENV=production
 COPY --from=prod-deps /app/node_modules ./node_modules
 COPY package.json tsconfig.json prisma.config.ts ./
-COPY src ./src
+COPY src/server ./src/server
+COPY src/shared ./src/shared
+COPY src/lib ./src/lib
 COPY --from=build /app/src/generated ./src/generated
 USER node
 EXPOSE 4000
 HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://127.0.0.1:4000/health || exit 1
-CMD ["npx", "tsx", "src/server/index.ts"]
+# node runs directly (not through npx) so SIGTERM reaches the server and it can shut down gracefully
+CMD ["node", "--import", "tsx", "src/server/index.ts"]

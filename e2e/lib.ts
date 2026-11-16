@@ -1,5 +1,9 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, mkdirSync } from "node:fs";
+
+// logs/ is not in git, so a fresh checkout (for example in CI) does not have it
+mkdirSync("logs/evidence", { recursive: true });
+mkdirSync("logs/security", { recursive: true });
 import type { Page } from "playwright";
 
 export const WEB_PORT = 3100;

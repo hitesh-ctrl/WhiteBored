@@ -168,6 +168,30 @@ await check("text: placed, shown to others, stored as text, and markup stays tex
   await shot(B, "f03-text-in-B");
 });
 
+await check("text typed into the box is kept when focus moves to a colour button", async () => {
+  const box = (await A.locator("canvas").boundingBox())!;
+  const before = await ink(B);
+  await pick(A, "Text");
+  await A.mouse.click(box.x + box.width * 0.1, box.y + box.height * 0.72);
+  await A.getByLabel("Text to place on the board").fill("kept on blur");
+  await A.getByRole("button", { name: "Blue", exact: true }).click();
+  await waitUntil(async () => (await ink(B)) > before + 100, 5000, "blur text visible in B");
+  if (!(await prisma.stroke.findFirst({ where: { boardId, kind: "text", text: "kept on blur" } }))) throw new Error("not stored");
+  await A.getByRole("button", { name: "Black", exact: true }).click();
+  await pick(A, "Pen");
+});
+await check("an empty text box that loses focus creates nothing", async () => {
+  const n = await prisma.stroke.count({ where: { boardId } });
+  const box = (await A.locator("canvas").boundingBox())!;
+  await pick(A, "Text");
+  await A.mouse.click(box.x + box.width * 0.6, box.y + box.height * 0.9);
+  await A.getByLabel("Text to place on the board").waitFor({ timeout: 3000 });
+  await A.getByRole("button", { name: "Red", exact: true }).click();
+  await A.getByRole("button", { name: "Black", exact: true }).click();
+  await sleep(500);
+  if ((await prisma.stroke.count({ where: { boardId } })) !== n) throw new Error("an empty text stroke was created");
+  await pick(A, "Pen");
+});
 await check("export: SVG is escaped and complete, PNG is a real PNG, names are safe", async () => {
   const [svgDl] = await Promise.all([A.waitForEvent("download"), A.getByRole("button", { name: "Export SVG" }).click()]);
   const svg = readFileSync((await svgDl.path())!, "utf8");

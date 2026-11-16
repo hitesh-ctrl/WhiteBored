@@ -1,12 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { newId } from "../lib/ids";
+import { newId, newSecret } from "../lib/ids";
 import { nameSchema } from "../shared/protocol";
 import Whiteboard from "./Whiteboard";
 
 const NAME_KEY = "whiteboard:name";
 const CLIENT_KEY = "whiteboard:clientId";
+const CLIENT_SECRET_KEY = "whiteboard:clientKey";
 const OWNER_PREFIX = "whiteboard:owner:";
 const OWNER_FRAGMENT = /^#owner=([A-Za-z0-9_-]{16,128})$/;
 
@@ -26,6 +27,7 @@ export default function Board(props: { boardId?: string; viewId?: string; boardN
   const [ready, setReady] = useState(false);
   const [name, setName] = useState<string | null>(null);
   const [clientId, setClientId] = useState("");
+  const [clientKey, setClientKey] = useState("");
   const [ownerKey, setOwnerKey] = useState<string | undefined>();
   const [draft, setDraft] = useState("");
   const [error, setError] = useState("");
@@ -35,6 +37,12 @@ export default function Board(props: { boardId?: string; viewId?: string; boardN
     if (!id) {
       id = newId();
       write(() => sessionStorage, CLIENT_KEY, id);
+    }
+    // The client id is public (it is in every stroke); this secret proves it is really us.
+    let secret = read(() => sessionStorage, CLIENT_SECRET_KEY);
+    if (!secret) {
+      secret = newSecret();
+      write(() => sessionStorage, CLIENT_SECRET_KEY, secret);
     }
     let owner: string | undefined;
     if (boardId) {
@@ -50,6 +58,7 @@ export default function Board(props: { boardId?: string; viewId?: string; boardN
     // Storage only exists in the browser, so it can only be read after mount.
     /* eslint-disable react-hooks/set-state-in-effect */
     setClientId(id);
+    setClientKey(secret);
     setOwnerKey(owner);
     setName(saved.success ? saved.data : null);
     setReady(true);
@@ -86,5 +95,5 @@ export default function Board(props: { boardId?: string; viewId?: string; boardN
     );
   }
 
-  return <Whiteboard boardId={boardId} viewId={viewId} boardName={boardName} name={name} clientId={clientId} ownerKey={ownerKey} />;
+  return <Whiteboard boardId={boardId} viewId={viewId} boardName={boardName} name={name} clientId={clientId} clientKey={clientKey} ownerKey={ownerKey} />;
 }

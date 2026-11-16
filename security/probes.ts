@@ -226,6 +226,36 @@ await probe("edit id and view id are not interchangeable", async () => {
   return "view id as edit id and edit id as view id both not_found; both together invalid";
 });
 
+
+await probe("knowing a client id is not enough to delete that person's strokes or take their place", async () => {
+  const b = await prisma.board.create({ data: { name: "identity probe" } });
+  const victim = randomUUID();
+  const v = await connect();
+  const key = "v".repeat(32);
+  const j = await v.emitWithAck("board:join", { boardId: b.id, clientId: victim, name: "Victim", clientKey: key });
+  must(j.ok, "victim join failed");
+  const st = stroke();
+  must((await v.emitWithAck("stroke:commit", st)).ok, "commit failed");
+  await sleep(300);
+  // the attacker reads the victim's id from the board and tries to join as them, with and without a key
+  const attacker = await connect();
+  const a1 = await attacker.emitWithAck("board:join", { boardId: b.id, clientId: victim, name: "Impostor" });
+  await sleep(300);
+  const a2 = await attacker.emitWithAck("board:join", { boardId: b.id, clientId: victim, name: "Impostor", clientKey: "x".repeat(32) });
+  must(a1.error === "forbidden" && a2.error === "forbidden", JSON.stringify([a1, a2]));
+  // after the victim leaves, the id is free but the strokes still need the victim's key
+  v.close();
+  await sleep(400);
+  const late = await connect();
+  const a3 = await late.emitWithAck("board:join", { boardId: b.id, clientId: victim, name: "Impostor", clientKey: "x".repeat(32) });
+  must(a3.ok, "join under a free id failed");
+  const u = await late.emitWithAck("stroke:undo", { id: st.id });
+  must(u.error === "forbidden", `undo gave ${JSON.stringify(u)}`);
+  must((await prisma.stroke.count({ where: { id: st.id } })) === 1, "stroke was deleted");
+  await prisma.board.delete({ where: { id: b.id } });
+  return "join under a present id refused (with and without a key); undo without the key refused; stroke intact";
+});
+
 writeFileSync("logs/security/probes.json", JSON.stringify(results, null, 2));
 open.forEach((s) => s.close());
 server.kill("SIGTERM");

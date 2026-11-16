@@ -24,6 +24,8 @@ model Stroke {
   boardId    String   @db.Uuid
   board      Board    @relation(fields: [boardId], references: [id], onDelete: Cascade)
   authorId   String   @db.Uuid
+  /// SHA-256 hex of the author's secret client key. Null for strokes made without one.
+  authorProof String?
   kind       String   @default("pen")
   text       String?
   color      String

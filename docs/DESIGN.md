@@ -191,3 +191,12 @@ Authentication and per-board permissions, board deletion, multi-server scaling (
 
 ### Still out of scope
 Follow mode (viewport sync), a Redis adapter and multi-process presence, history paging or snapshots (compression only reduces the size), accounts, board deletion, SVG-path import.
+
+## 11. Revisions after the second review
+- **Author identity.** A client id is public (it is in every stroke and in the join ack), so it can no longer be the only proof of authorship. The browser keeps a random secret per tab and sends it as `clientKey` when it joins. The server stores only its SHA-256 on each stroke (`authorProof`) and in presence. Undo and re-sending a stroke need the same key; a join under a client id that is already present with a different key is refused (`forbidden`). Strokes made without a key (older boards, scripted clients) are still matched by client id alone. Out of scope: presence after a server restart (the first join wins until a client leaves).
+- **Client address behind proxies.** `TRUST_PROXY` is a number of trusted proxies, counted from the END of `X-Forwarded-For`; entries a client puts in front are ignored. IPv6 addresses are grouped by /64.
+- **Undo limit.** Undo has its own bucket (30 per second, burst 60) because the eraser sends one undo per stroke; clear and rename keep 5 per second, burst 10. The browser retries a rate-limited removal instead of showing the stroke again.
+- **Points** are rounded to one decimal on the server before they are stored or relayed.
+- **Text and names** reject control characters, bidirectional override characters, U+FFFE and U+FFFF, and lone surrogates. Emoji joiners are allowed.
+- **/metrics** can require a bearer token (`METRICS_TOKEN`); `/health` and `/metrics` match on the path, so a query string does not matter.
+- **Browser.** A commit retry stops if the stroke was removed meanwhile; erase and undo do nothing while not joined; a join that fails with `internal` or `rate_limited` is retried; remote live strokes are capped at 5 per author; text typed into the box is kept when it loses focus; the redo list is dropped when the connection is re-established.

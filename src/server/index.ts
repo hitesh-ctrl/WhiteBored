@@ -1,5 +1,6 @@
 import "dotenv/config"; // must stay the first import so DATABASE_URL is set before Prisma is used
 import { createPrisma } from "../lib/prisma";
+import { trustHops } from "../lib/proxy";
 import { createWhiteboardServer } from "./app";
 
 const port = Number(process.env.SOCKET_PORT ?? 4000);
@@ -11,10 +12,11 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("SOCKET
 
 const maxConnectionsPerIp = Number(process.env.MAX_CONNECTIONS_PER_IP ?? 30);
 if (!Number.isInteger(maxConnectionsPerIp) || maxConnectionsPerIp < 1) throw new Error("MAX_CONNECTIONS_PER_IP is invalid");
-const trustProxy = process.env.TRUST_PROXY === "true";
+const trustProxy = trustHops(process.env.TRUST_PROXY);
+const metricsToken = process.env.METRICS_TOKEN || undefined;
 
 const prisma = createPrisma();
-const { httpServer, io } = createWhiteboardServer({ prisma, corsOrigin, maxConnectionsPerIp, trustProxy });
+const { httpServer, io } = createWhiteboardServer({ prisma, corsOrigin, maxConnectionsPerIp, trustProxy, metricsToken });
 
 httpServer.listen(port, () => console.log(`socket server listening on :${port}`));
 

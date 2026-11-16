@@ -1,6 +1,9 @@
 # Local full stack: Postgres, one-off migration, socket server and web app.
 # Set the values below in your shell or an env file; nothing secret is stored here.
 #   POSTGRES_PASSWORD=choose-one docker compose up --build
+# Use letters and digits in POSTGRES_PASSWORD (it is placed inside a connection URL).
+# Behind a reverse proxy set TRUST_PROXY to the number of proxies in front of the socket server,
+# otherwise every client shares the address of the proxy and the per-address cap applies to all.
 name: whiteboard
 services:
   db:
@@ -27,7 +30,10 @@ services:
     environment:
       DATABASE_URL: postgresql://whiteboard:${POSTGRES_PASSWORD}@db:5432/whiteboard
       SOCKET_PORT: "4000"
-      CORS_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
+      CORS_ORIGIN: ${WEB_ORIGIN:-http://localhost:${WEB_HOST_PORT:-3000}}
+      TRUST_PROXY: ${TRUST_PROXY:-0}
+      MAX_CONNECTIONS_PER_IP: ${MAX_CONNECTIONS_PER_IP:-30}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
     ports: ["${SOCKET_HOST_PORT:-4000}:4000"]
     depends_on: { migrate: { condition: service_completed_successfully } }
 
@@ -36,9 +42,10 @@ services:
       context: .
       target: web
       args:
-        NEXT_PUBLIC_SOCKET_URL: ${SOCKET_PUBLIC_URL:-http://localhost:4000}
+        NEXT_PUBLIC_SOCKET_URL: ${SOCKET_PUBLIC_URL:-http://localhost:${SOCKET_HOST_PORT:-4000}}
     environment:
       DATABASE_URL: postgresql://whiteboard:${POSTGRES_PASSWORD}@db:5432/whiteboard
+      TRUST_PROXY: ${TRUST_PROXY:-0}
     ports: ["${WEB_HOST_PORT:-3000}:3000"]
     depends_on: { migrate: { condition: service_completed_successfully } }
 

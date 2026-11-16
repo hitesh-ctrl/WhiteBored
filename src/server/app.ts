@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
+import { clientAddress, trustHops } from "../lib/proxy";
 import { Server, type Socket } from "socket.io";
 import type { PrismaClient } from "../generated/prisma/client";
 import {
@@ -8,7 +9,7 @@ import {
 import {
   commitSchema, cursorSchema, joinSchema, progressSchema, renameSchema, roomOf, undoSchema,
   type ClientToServerEvents, type ErrorCode, type JoinAck, type Role, type ServerToClientEvents,
-  type SocketData, type Stroke, type User,
+  type Point, type SocketData, type Stroke, type User,
 } from "../shared/protocol";
 import { createBuckets, type LimitKind } from "./rateLimit";
 
@@ -22,11 +23,18 @@ export interface WhiteboardServerOptions {
   corsOrigin: string;
   /** Connections allowed from one client address at the same time. */
   maxConnectionsPerIp?: number;
-  /** Take the client address from the first X-Forwarded-For entry. Only enable behind a proxy you control. */
-  trustProxy?: boolean;
+  /**
+   * How many trusted proxies sit in front of this server (true means 1). Their X-Forwarded-For
+   * entries, counted from the end, give the client address. 0 or false ignores the header.
+   */
+  trustProxy?: boolean | number;
+  /** When set, GET /metrics needs the header `Authorization: Bearer <token>`. */
+  metricsToken?: string;
 }
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest();
+const round1 = (n: number) => Math.round(n * 10) / 10;
+const roundPoints = (points: Point[]): Point[] => points.map(([x, y]) => [round1(x), round1(y)]);
 
 /** Constant-time check of an owner key against the stored hex hash. */
 function ownerKeyMatches(key: string, storedHex: string): boolean {
@@ -36,7 +44,8 @@ function ownerKeyMatches(key: string, storedHex: string): boolean {
 }
 
 export function createWhiteboardServer(opts: WhiteboardServerOptions) {
-  const { prisma, corsOrigin, trustProxy = false } = opts;
+  const { prisma, corsOrigin, metricsToken } = opts;
+  const hops = trustHops(opts.trustProxy);
   const maxPerIp = opts.maxConnectionsPerIp ?? MAX_CONNECTIONS_PER_IP;
 
   const metrics = {
@@ -55,12 +64,21 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
     ].map(([name, type, value]) => `# TYPE ${name} ${type}\n${name} ${value}\n`).join("");
 
   const httpServer = createServer((req, res) => {
-    if (req.url === "/health") {
+    let path = "";
+    try { path = new URL(req.url ?? "/", "http://localhost").pathname; } catch { /* malformed target, 404 below */ }
+    if (path === "/health") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end('{"ok":true}');
       return;
     }
-    if (req.url === "/metrics") {
+    if (path === "/metrics") {
+      if (metricsToken) {
+        const given = sha256(req.headers.authorization ?? "");
+        if (!timingSafeEqual(given, sha256(`Bearer ${metricsToken}`))) {
+          res.writeHead(401, { "www-authenticate": "Bearer" }).end();
+          return;
+        }
+      }
       res.writeHead(200, { "content-type": "text/plain; version=0.0.4; charset=utf-8" });
       res.end(metricsText());
       return;
@@ -82,7 +100,7 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
   });
 
   /** boardId -> clientId -> user with the socket ids it currently has open. */
-  const presence = new Map<string, Map<string, { name: string; sockets: Set<string> }>>();
+  const presence = new Map<string, Map<string, { name: string; proof: string | null; sockets: Set<string> }>>();
   const usersOf = (boardId: string): User[] =>
     [...(presence.get(boardId) ?? [])].map(([id, u]) => ({ id, name: u.name }));
 
@@ -105,8 +123,7 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
   const perIp = new Map<string, number>();
   const addressOf = (socket: IoSocket) => {
     const forwarded = socket.handshake.headers["x-forwarded-for"];
-    const first = (Array.isArray(forwarded) ? forwarded[0] : forwarded)?.split(",")[0]?.trim();
-    return trustProxy && first ? first : socket.handshake.address;
+    return clientAddress(Array.isArray(forwarded) ? forwarded.join(",") : forwarded, hops, socket.handshake.address);
   };
 
   io.on("connection", (socket) => {
@@ -157,9 +174,9 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
     const fail = (ack: Ackfn, error: ErrorCode) => ack?.({ ok: false, error } as never);
     const done = (ack: Ackfn) => ack?.({ ok: true } as never);
     const ctx = () => {
-      const { boardId, clientId, name, role, canClear } = socket.data;
+      const { boardId, clientId, name, role, canClear, proof } = socket.data;
       return boardId && clientId && name && role
-        ? { boardId, clientId, name, role, canClear: !!canClear, room: roomOf(boardId) }
+        ? { boardId, clientId, name, role, canClear: !!canClear, proof: proof ?? null, room: roomOf(boardId) }
         : null;
     };
 
@@ -168,7 +185,8 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
       if (!parsed.success) return fail(ack, "invalid");
       if (socket.data.boardId || socket.data.joining) return fail(ack, "already_joined");
       socket.data.joining = true;
-      const { boardId: editId, viewId, clientId, name, ownerKey } = parsed.data;
+      const { boardId: editId, viewId, clientId, name, ownerKey, clientKey } = parsed.data;
+      const proof = clientKey ? sha256(clientKey).toString("hex") : null;
       try {
         const board = await prisma.board.findUnique({
           where: editId ? { id: editId } : { id: undefined, viewId },
@@ -186,6 +204,10 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
         const canClear = role === "owner" || (role === "editor" && board.ownerHash === null);
         const boardId = board.id;
         const room = roomOf(boardId);
+        // A client id is public (it is in every stroke), so it only counts as one person while
+        // the same secret key is shown. A different key under a present id is somebody else.
+        const present = presence.get(boardId)?.get(clientId);
+        if (present && present.proof !== proof) return fail(ack, "forbidden");
 
         // Join the room before reading history so no live event can fall between the two.
         await socket.join(room);
@@ -202,9 +224,15 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
           await socket.leave(room);
           return;
         }
+        const racing = presence.get(boardId)?.get(clientId);
+        if (racing && racing.proof !== proof) {
+          await socket.leave(room); // another join with this id finished while we were reading
+          return fail(ack, "forbidden");
+        }
         socket.data.boardId = boardId;
         socket.data.clientId = clientId;
         socket.data.name = name;
+        socket.data.proof = proof;
         socket.data.role = role;
         socket.data.canClear = canClear;
         metrics.joinsTotal++;
@@ -216,7 +244,7 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
           existing.sockets.add(socket.id);
           existing.name = name;
         } else {
-          board_.set(clientId, { name, sockets: new Set([socket.id]) });
+          board_.set(clientId, { name, proof, sockets: new Set([socket.id]) });
           socket.to(room).emit("user:joined", { id: clientId, name });
         }
 
@@ -241,7 +269,7 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
       if (!c || c.role === "viewer") return;
       const parsed = progressSchema.safeParse(raw);
       if (!parsed.success) return;
-      socket.to(c.room).emit("stroke:progress", { ...parsed.data, authorId: c.clientId });
+      socket.to(c.room).emit("stroke:progress", { ...parsed.data, points: roundPoints(parsed.data.points), authorId: c.clientId });
     });
 
     for (const event of ["cursor:move", "laser:move"] as const) {
@@ -260,15 +288,17 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
       if (c.role === "viewer") return fail(ack, "forbidden");
       const parsed = commitSchema.safeParse(raw);
       if (!parsed.success) return fail(ack, "invalid");
-      const s = parsed.data;
+      const s = { ...parsed.data, points: roundPoints(parsed.data.points) };
 
       await inBoardOrder(c.boardId, async () => {
         const outcome = await prisma.$transaction(async (tx) => {
           // One writer per board at a time, so the cap check and the insert cannot interleave.
           await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${c.boardId}, 0))`;
-          const existing = await tx.stroke.findUnique({ where: { id: s.id }, select: { boardId: true, authorId: true } });
+          const existing = await tx.stroke.findUnique({ where: { id: s.id }, select: { boardId: true, authorId: true, authorProof: true } });
           if (existing) {
-            return existing.boardId === c.boardId && existing.authorId === c.clientId ? "duplicate" : "forbidden";
+            const sameAuthor = existing.boardId === c.boardId && existing.authorId === c.clientId &&
+              (existing.authorProof === null || existing.authorProof === c.proof);
+            return sameAuthor ? "duplicate" : "forbidden";
           }
           const totals = await tx.stroke.aggregate({
             where: { boardId: c.boardId },
@@ -279,7 +309,7 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
           if ((totals._sum.pointCount ?? 0) + s.points.length > MAX_POINTS_PER_BOARD) return "board_full";
           const res = await tx.stroke.createMany({
             data: [{
-              id: s.id, boardId: c.boardId, authorId: c.clientId, color: s.color, width: s.width,
+              id: s.id, boardId: c.boardId, authorId: c.clientId, authorProof: c.proof, color: s.color, width: s.width,
               kind: s.kind, text: s.text ?? null, points: s.points, pointCount: s.points.length,
             }],
             skipDuplicates: true,
@@ -298,7 +328,7 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
       });
     });
 
-    on("stroke:undo", "mutate", async (raw, ack) => {
+    on("stroke:undo", "undo", async (raw, ack) => {
       const c = ctx();
       if (!c) return fail(ack, "not_joined");
       if (c.role === "viewer") return fail(ack, "forbidden");
@@ -306,7 +336,9 @@ export function createWhiteboardServer(opts: WhiteboardServerOptions) {
       if (!parsed.success) return fail(ack, "invalid");
       await inBoardOrder(c.boardId, async () => {
         const res = await prisma.stroke.deleteMany({
-          where: { id: parsed.data.id, boardId: c.boardId, authorId: c.clientId },
+          // Strokes made with a key can only be removed with the same key. Strokes made without one
+          // (older boards, scripted clients) are matched by client id alone, as before.
+          where: { id: parsed.data.id, boardId: c.boardId, authorId: c.clientId, OR: [{ authorProof: c.proof }, { authorProof: null }] },
         });
         if (res.count === 0) return fail(ack, "forbidden");
         socket.to(c.room).emit("stroke:remove", { id: parsed.data.id });

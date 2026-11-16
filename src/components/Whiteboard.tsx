@@ -14,7 +14,7 @@ import { throttle } from "../lib/throttle";
 import { DEFAULT_VIEW, MAX_ZOOM, clampView, zoomAt, type View } from "../lib/viewport";
 import { CANVAS_HEIGHT, CANVAS_WIDTH, MAX_POINTS_PER_STROKE, MAX_TEXT_LENGTH, fontSizeFor } from "../shared/limits";
 import {
-  authoredProgressSchema, authoredStrokeSchema, remoteCursorSchema, removeSchema, renamedSchema,
+  BAD_TEXT_CHARS, authoredProgressSchema, authoredStrokeSchema, remoteCursorSchema, removeSchema, renamedSchema,
   userLeftSchema, userSchema,
   type ClientToServerEvents, type Kind, type Point, type Role, type ServerToClientEvents, type Stroke,
   type StrokeInput, type User,
@@ -33,6 +33,8 @@ type Tool = (typeof TOOLS)[number][0];
 const SHAPE_TOOLS = new Set<string>(["line", "arrow", "rect", "ellipse"]);
 const VIEWER_TOOLS = new Set<Tool>(["laser", "hand"]);
 const MAX_LIVE_STROKES = 200;
+const MAX_LIVE_PER_AUTHOR = 5;
+const BAD_TEXT_CHARS_GLOBAL = new RegExp(BAD_TEXT_CHARS.source, "gu");
 const MAX_BUFFERED_EVENTS = 5000;
 const ERASER_RADIUS_PX = 10; // on screen, converted to canvas units with the zoom
 
@@ -47,10 +49,10 @@ const noApi: Api = {
   undo() {}, redo() {}, clear() {}, zoomBy() {}, resetView() {}, exportPng() {}, exportSvg() {}, rename() {}, commitText() {},
 };
 
-type Props = { boardId?: string; viewId?: string; boardName: string; name: string; clientId: string; ownerKey?: string };
+type Props = { boardId?: string; viewId?: string; boardName: string; name: string; clientId: string; clientKey: string; ownerKey?: string };
 
 export default function Whiteboard(props: Props) {
-  const { boardId, viewId, boardName, name, clientId, ownerKey } = props;
+  const { boardId, viewId, boardName, name, clientId, clientKey, ownerKey } = props;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cursorLayerRef = useRef<HTMLDivElement>(null);
   const apiRef = useRef<Api>(noApi);
@@ -59,6 +61,7 @@ export default function Whiteboard(props: Props) {
   const colorRef = useRef<string>(COLORS[0][1]);
   const widthRef = useRef(4);
   const titleRef = useRef(boardName);
+  const textDoneRef = useRef(false); // the text box was already committed or cancelled, so blur must not commit again
 
   // Only text and flags that appear in the UI live in React state.
   const [status, setStatus] = useState("Connecting...");
@@ -189,6 +192,18 @@ export default function Whiteboard(props: Props) {
         socket.connect();
       }
     };
+    /** Remote live strokes are capped per author and in total, so one client cannot flood the screen. */
+    const setLive = (key: string, authorId: string, d: Drawable) => {
+      if (!live.has(key)) {
+        const mine = [...live.keys()].filter((k) => k.startsWith(`${authorId}:`));
+        const evict = mine.length >= MAX_LIVE_PER_AUTHOR ? mine[0] : live.size >= MAX_LIVE_STROKES ? live.keys().next().value : undefined;
+        if (evict !== undefined) {
+          live.delete(evict);
+          liveSeen.delete(evict);
+        }
+      }
+      live.set(key, d);
+    };
     const removeCursor = (id: string) => {
       cursors.get(id)?.el.remove();
       cursors.delete(id);
@@ -242,16 +257,11 @@ export default function Whiteboard(props: Props) {
       liveSeen.set(key, Date.now());
       const cur = live.get(key);
       if (p.data.kind !== "pen") {
-        live.set(key, { kind: p.data.kind, color: p.data.color, width: p.data.width, points: [...p.data.points] }); // shapes: replace
+        setLive(key, p.data.authorId, { kind: p.data.kind, color: p.data.color, width: p.data.width, points: [...p.data.points] }); // shapes: replace
       } else if (cur) {
         if (cur.points.length < MAX_POINTS_PER_STROKE) cur.points.push(...p.data.points.slice(1));
       } else {
-        if (live.size >= MAX_LIVE_STROKES) {
-          const oldest = live.keys().next().value!;
-          live.delete(oldest);
-          liveSeen.delete(oldest);
-        }
-        live.set(key, { kind: "pen", color: p.data.color, width: p.data.width, points: [...p.data.points] });
+        setLive(key, p.data.authorId, { kind: "pen", color: p.data.color, width: p.data.width, points: [...p.data.points] });
       }
       schedule();
     }));
@@ -310,8 +320,7 @@ export default function Whiteboard(props: Props) {
       l.y = p.data.y;
       place(l.el, l.x, l.y);
       clearTimeout(l.timer);
-      const el = l.el;
-      l.timer = setTimeout(() => { el.style.display = "none"; }, 1500); // the laser fades when it stops moving
+      l.timer = setTimeout(() => removeLaser(p.data.id), 1500); // the laser disappears when it stops moving
     });
 
     // A remote stroke whose author never committed it (rejected, or the author lost connection)
@@ -331,7 +340,8 @@ export default function Whiteboard(props: Props) {
 
     /* ----- commit, undo, redo, erase, clear ----- */
     const sendCommit = (s: StrokeInput, attempt = 0) => {
-      if (!joined) return; // stays in `pending`, re-sent after the next join
+      if (!joined) return;
+      if (attempt > 0 && !pending.has(s.id)) return; // removed while the retry was waiting // stays in `pending`, re-sent after the next join
       socket.timeout(5000).emit("stroke:commit", s, (err, res) => {
         if (disposed) return;
         if (err) {
@@ -368,9 +378,17 @@ export default function Whiteboard(props: Props) {
         erasing.add(stroke.id);
         removeStroke(stroke.id);
       }
+      sendRemove(stroke, optimistic, 0);
+    };
+    const sendRemove = (stroke: Stroke, optimistic: boolean, attempt: number) => {
       socket.timeout(5000).emit("stroke:undo", { id: stroke.id }, (err, res) => {
-        erasing.delete(stroke.id);
         if (disposed) return;
+        if (!err && !res.ok && res.error === "rate_limited" && attempt < 6) {
+          // a long sweep with the eraser can outrun the server's limit; wait instead of giving the stroke back
+          setTimeout(() => { if (!disposed) sendRemove(stroke, optimistic, attempt + 1); }, 200 * (attempt + 1));
+          return;
+        }
+        erasing.delete(stroke.id);
         if (!err && (res.ok || res.error === "forbidden")) {
           if (!optimistic) removeStroke(stroke.id);
           if (res.ok) { hist.pushRedo(stroke); syncUi(); }
@@ -439,7 +457,7 @@ export default function Whiteboard(props: Props) {
         });
       },
       commitText(x, y, text) {
-        const clean = text.replace(/\p{Cc}/gu, "").trim().slice(0, MAX_TEXT_LENGTH);
+        const clean = text.replace(BAD_TEXT_CHARS_GLOBAL, "").trim().slice(0, MAX_TEXT_LENGTH).replace(/[\uD800-\uDBFF]$/, "");
         if (!clean || !joined || myRole === "viewer") return;
         commitLocal({ id: newId(), kind: "text", color: colorRef.current, width: widthRef.current, points: [[x, y]], text: clean });
       },
@@ -451,8 +469,8 @@ export default function Whiteboard(props: Props) {
       buffer = [];
       setStatus("Joining...");
       const payload = viewId
-        ? { viewId, clientId, name }
-        : { boardId, clientId, name, ...(ownerKey ? { ownerKey } : {}) };
+        ? { viewId, clientId, name, clientKey }
+        : { boardId, clientId, name, clientKey, ...(ownerKey ? { ownerKey } : {}) };
       socket.timeout(10000).emit("board:join", payload, (err, ack) => {
         if (disposed) return;
         if (err) {
@@ -465,7 +483,19 @@ export default function Whiteboard(props: Props) {
           }, 2000);
           return;
         }
-        if (!ack.ok) return setStatus(ack.error === "not_found" ? "Board not found" : "Could not join the board");
+        if (!ack.ok) {
+          if (ack.error === "internal" || ack.error === "rate_limited") {
+            setStatus("Could not join the board, retrying...");
+            setTimeout(() => {
+              if (!disposed) {
+                socket.disconnect();
+                socket.connect();
+              }
+            }, 3000);
+            return;
+          }
+          return setStatus(ack.error === "not_found" ? "Board not found" : "Could not join the board");
+        }
         strokes.length = 0;
         for (const raw of ack.strokes) {
           const one = authoredStrokeSchema.safeParse(raw);
@@ -539,6 +569,7 @@ export default function Whiteboard(props: Props) {
       commitLocal({ id: d.id, kind: d.kind, color: d.color, width: d.width, points: d.points });
     };
     const eraseAt = (p: Point) => {
+      if (!joined) return;
       const radius = ERASER_RADIUS_PX / curView.zoom;
       for (const s of [...strokes]) {
         if (s.authorId !== clientId || pending.has(s.id) || erasing.has(s.id)) continue;
@@ -560,6 +591,7 @@ export default function Whiteboard(props: Props) {
       if (t === "text") {
         const p = point(e);
         const rect = canvas.getBoundingClientRect();
+        textDoneRef.current = false;
         setTextDraft({ x: p[0], y: p[1], px: (fontSizeFor(widthRef.current) * curView.zoom * rect.width) / CANVAS_WIDTH });
         e.preventDefault();
         return;
@@ -630,7 +662,8 @@ export default function Whiteboard(props: Props) {
       e.preventDefault(); // zoom the board instead of scrolling the page
       const rect = canvas.getBoundingClientRect();
       const [ax, ay] = toCanvasPointRaw(e.clientX, e.clientY, rect, curView);
-      setView(zoomAt(curView, curView.zoom * Math.exp(-e.deltaY * 0.0015), [ax, ay]));
+      const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * 100 : e.deltaY; // lines and pages to pixels
+      setView(zoomAt(curView, curView.zoom * Math.exp(-dy * 0.0015), [ax, ay]));
     };
     canvas.addEventListener("pointerdown", onDown);
     canvas.addEventListener("pointermove", onMove);
@@ -638,6 +671,8 @@ export default function Whiteboard(props: Props) {
     canvas.addEventListener("pointercancel", onUp);
     canvas.addEventListener("lostpointercapture", onUp);
     canvas.addEventListener("wheel", onWheel, { passive: false });
+    const noMenu = (e: Event) => e.preventDefault(); // a long press must not open a menu and cancel the stroke
+    canvas.addEventListener("contextmenu", noMenu);
 
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
@@ -658,6 +693,7 @@ export default function Whiteboard(props: Props) {
       canvas.removeEventListener("pointercancel", onUp);
       canvas.removeEventListener("lostpointercapture", onUp);
       canvas.removeEventListener("wheel", onWheel);
+      canvas.removeEventListener("contextmenu", noMenu);
       clearInterval(sweep);
       if (drawing) clearInterval(drawing.timer);
       for (const id of [...lasers.keys()]) removeLaser(id);
@@ -782,10 +818,20 @@ export default function Whiteboard(props: Props) {
               fontSize: textDraft.px, color, minWidth: "8ch",
             }}
             onKeyDown={(e) => {
-              if (e.key === "Enter") { apiRef.current.commitText(textDraft.x, textDraft.y, e.currentTarget.value); setTextDraft(null); }
-              else if (e.key === "Escape") setTextDraft(null);
+              if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+                textDoneRef.current = true;
+                apiRef.current.commitText(textDraft.x, textDraft.y, e.currentTarget.value);
+                setTextDraft(null);
+              } else if (e.key === "Escape") {
+                textDoneRef.current = true;
+                setTextDraft(null);
+              }
             }}
-            onBlur={() => setTextDraft(null)}
+            onBlur={(e) => {
+              // clicking a colour or switching windows keeps what was typed
+              if (!textDoneRef.current) apiRef.current.commitText(textDraft.x, textDraft.y, e.currentTarget.value);
+              setTextDraft(null);
+            }}
           />
         )}
       </div>

@@ -45,6 +45,45 @@ describe("connections per client address", () => {
   });
 });
 
+describe("trusted proxy hops", () => {
+  it("one hop: the last entry counts, so a client cannot dodge the cap by prepending values", async () => {
+    const srv = await start({ maxConnectionsPerIp: 1, trustProxy: 1 });
+    await srv.connect({ "x-forwarded-for": "random-1, 1.1.1.1" });
+    const same = await srv.connect({ "x-forwarded-for": "random-2, 1.1.1.1" });
+    expect(await dropped(same)).toBe(true);
+    const other = await srv.connect({ "x-forwarded-for": "random-3, 2.2.2.2" });
+    expect(await dropped(other, 800)).toBe(false);
+  });
+  it("two hops: the second entry from the right counts", async () => {
+    const srv = await start({ maxConnectionsPerIp: 1, trustProxy: 2 });
+    await srv.connect({ "x-forwarded-for": "9.9.9.9, 1.1.1.1, 10.0.0.1" });
+    const same = await srv.connect({ "x-forwarded-for": "8.8.8.8, 1.1.1.1, 10.0.0.2" });
+    expect(await dropped(same)).toBe(true);
+  });
+  it("addresses in one IPv6 /64 share one allowance", async () => {
+    const srv = await start({ maxConnectionsPerIp: 1, trustProxy: 1 });
+    await srv.connect({ "x-forwarded-for": "2001:db8:1:2:3:4:5:6" });
+    const same = await srv.connect({ "x-forwarded-for": "2001:db8:1:2:ffff:0:0:1" });
+    expect(await dropped(same)).toBe(true);
+  });
+});
+
+describe("plain http routes", () => {
+  it("serves /health and /metrics with a query string, and 404 for anything else", async () => {
+    const srv = await start();
+    expect((await fetch(`${srv.url}/health?x=1`)).status).toBe(200);
+    expect((await fetch(`${srv.url}/metrics?x=1`)).status).toBe(200);
+    expect((await fetch(`${srv.url}/nothing`)).status).toBe(404);
+  });
+  it("protects /metrics with a bearer token when one is configured, and leaves /health open", async () => {
+    const srv = await start({ metricsToken: "s3cret-token-value" });
+    expect((await fetch(`${srv.url}/metrics`)).status).toBe(401);
+    expect((await fetch(`${srv.url}/metrics`, { headers: { authorization: "Bearer wrong" } })).status).toBe(401);
+    expect((await fetch(`${srv.url}/metrics`, { headers: { authorization: "Bearer s3cret-token-value" } })).status).toBe(200);
+    expect((await fetch(`${srv.url}/health`)).status).toBe(200);
+  });
+});
+
 describe("metrics", () => {
   const read = async (url: string) => {
     const text = await (await fetch(`${url}/metrics`)).text();

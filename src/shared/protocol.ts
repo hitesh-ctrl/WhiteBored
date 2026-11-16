@@ -7,12 +7,14 @@ import {
 /* ---------- field schemas ---------- */
 
 export const idSchema = z.uuid();
+/** Control characters, bidirectional overrides (they can disguise names), non-characters and lone surrogates. */
+export const BAD_TEXT_CHARS = /[\p{Cc}\p{Cs}\u202A-\u202E\u2066-\u2069\uFFFE\uFFFF]/u;
 export const nameSchema = z
   .string()
   .trim()
   .min(1)
   .max(MAX_NAME_LENGTH)
-  .refine((s) => !/\p{Cc}/u.test(s), "control characters are not allowed");
+  .refine((s) => !BAD_TEXT_CHARS.test(s), "control or direction-changing characters are not allowed");
 export const colorSchema = z.string().regex(/^#[0-9a-fA-F]{6}$/);
 export const widthSchema = z.number().int().min(MIN_WIDTH).max(MAX_WIDTH);
 const coord = (max: number) => z.number().min(0).max(max);
@@ -25,7 +27,7 @@ export const textSchema = z
   .string()
   .min(1)
   .max(MAX_TEXT_LENGTH)
-  .refine((s) => !/\p{Cc}/u.test(s), "control characters are not allowed");
+  .refine((s) => !BAD_TEXT_CHARS.test(s), "control or direction-changing characters are not allowed");
 
 const strokeBase = { id: idSchema, color: colorSchema, width: widthSchema, kind: kindSchema.default("pen") };
 
@@ -67,6 +69,8 @@ export const joinSchema = z
     clientId: idSchema,
     name: nameSchema,
     ownerKey: z.string().min(16).max(128).optional(),
+    /** A random secret the browser keeps per tab. Only its hash is kept; it ties a client id to its strokes. */
+    clientKey: z.string().min(16).max(128).optional(),
   })
   .refine((v) => (v.boardId === undefined) !== (v.viewId === undefined), "give exactly one of boardId and viewId");
 export const renameSchema = z.object({ name: nameSchema });
@@ -144,6 +148,8 @@ export interface SocketData {
   clientId?: string;
   name?: string;
   role?: Role;
+  /** SHA-256 hex of the client key, or null when the client sent none. */
+  proof?: string | null;
   canClear?: boolean;
   joining?: boolean;
 }
