@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
+import { copyText } from "../lib/clipboard";
 import { colorFor } from "../lib/color";
 import { nextBatch, ownStrokeIds, shouldAddPoint, toCanvasPoint } from "../lib/drawing";
 import { findFillContainer } from "../lib/fill";
@@ -84,6 +85,7 @@ export default function Whiteboard(props: Props) {
   const [view, setViewUi] = useState<View>(DEFAULT_VIEW);
   const [textDraft, setTextDraft] = useState<{ x: number; y: number; px: number } | null>(null);
   const [panningUi, setPanningUi] = useState(false);
+  const [copied, setCopied] = useState<"edit" | "view" | null>(null);
   const [selCount, setSelCount] = useState(0);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState("");
@@ -1006,12 +1008,13 @@ export default function Whiteboard(props: Props) {
     };
   }, [boardId, viewId, clientId, name, ownerKey]);
 
-  const copy = async (text: string, done: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
+  const copy = async (text: string, done: string, which: "edit" | "view") => {
+    if (await copyText(text)) {
       setNotice(done);
-    } catch {
-      // The clipboard only works on secure pages (https or localhost), so show the link to copy by hand.
+      setCopied(which);
+      setTimeout(() => setCopied(null), 2000);
+    } else {
+      // Neither copy method is allowed here, so show the link to copy by hand.
       window.prompt("Copy this link (Ctrl/Cmd+C):", text);
     }
   };
@@ -1063,8 +1066,8 @@ export default function Whiteboard(props: Props) {
         {readOnly && <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-900">View only</span>}
         {role === "owner" && <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-xs text-emerald-900">Owner</span>}
         <div className="ml-auto flex flex-wrap gap-2">
-          {boardId && <button onClick={() => copy(`${window.location.origin}/board/${boardId}`, "Edit link copied.")} className={btn}>Copy link</button>}
-          {shareViewId && <button onClick={() => copy(`${window.location.origin}/view/${shareViewId}`, "View-only link copied.")} className={btn}>Copy view-only link</button>}
+          {boardId && <button onClick={() => copy(`${window.location.origin}/board/${boardId}`, "Link copied. Send it to the people who should draw.", "edit")} aria-label="Copy link" className={btn}>{copied === "edit" ? "Link copied ✓" : "Copy link"}</button>}
+          {shareViewId && <button onClick={() => copy(`${window.location.origin}/view/${shareViewId}`, "View-only link copied. People with it can watch but not draw.", "view")} aria-label="Copy view-only link" className={btn}>{copied === "view" ? "Link copied ✓" : "Copy view-only link"}</button>}
         </div>
       </header>
 
@@ -1172,7 +1175,10 @@ export default function Whiteboard(props: Props) {
             </li>
           ))}
         </ul>
-        <span role="status" aria-live="polite" className="ml-auto text-slate-700">{notice}</span>
+      </div>
+      {/* messages appear in the corner of the window, so they are never below the visible area */}
+      <div role="status" aria-live="polite" className="pointer-events-none fixed bottom-4 right-4 z-50 max-w-sm">
+        {notice && <span className="block rounded bg-slate-900 px-3 py-2 text-sm text-white shadow-lg">{notice}</span>}
       </div>
     </main>
   );
