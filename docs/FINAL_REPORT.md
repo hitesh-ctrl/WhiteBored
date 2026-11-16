@@ -1,61 +1,64 @@
 # Final report
 
 ## What was built
-A real-time collaborative whiteboard. People open a board link, pick a name and draw on a shared 1600x900 canvas. Lines grow live in the other windows, named cursors are shown, each person can undo their own strokes (newest first, button or Ctrl/Cmd+Z), and the board can be cleared after a confirmation. Strokes are stored as points in Postgres, so a refresh, a late joiner or a server restart shows the full board.
+A real-time collaborative whiteboard. People open a board link, pick a name and draw on a shared canvas. Everyone sees lines grow live, sees each other's named and coloured cursors, and can undo or redo their own strokes. Everything is saved, so a refresh, a late joiner or a server restart shows the full board.
 
-- Web app: Next.js 16 (App Router), React 19, Tailwind 4. Home page with a create-board server action, board page that returns 404 for unknown or malformed ids.
-- Socket server: separate Node 22 process, Socket.IO 4.8, every client message validated with zod 4, rate limited per socket, one configured CORS origin, graceful shutdown.
-- Data: Prisma 7 and Postgres 16 (append-only stroke rows, per-board caps of 5000 strokes and 500,000 points).
-- Pinned exact versions, `prisma` and `@prisma/client` both 7.10.1.
+Drawing: pen, line, arrow, rectangle, ellipse and text; an eraser that removes the person's own strokes; zoom and pan; a laser pointer; PNG and SVG export.
+Sharing: the creator of a board is its owner and can clear and rename it; anyone with the board link can draw; a separate view-only link lets people watch and point without changing anything; each browser keeps a list of recent boards.
+Safety: every message is validated, every socket is rate limited, a stroke can only be removed by the person who drew it (bound to a secret key kept by the browser), connections are capped per client address, and names and text are always shown as text.
 
-Design and test approach: `docs/DESIGN.md`, `docs/TEST_PLAN.md`. Product notes: `docs/UNDERSTANDING.md`.
+Stack: Next.js 16, React 19, Tailwind 4, a separate Node 22 Socket.IO 4.8 server, Prisma 7 with Postgres 16, zod 4, vitest, Playwright. Exact versions are pinned; `prisma` and `@prisma/client` are both 7.10.1.
 
-## How to run
-See `README.md`. In short: `npm ci`, copy `.env.example` to `.env` and set the database URLs, `npm run db:deploy`, then `npm run server` and `npm run dev`.
+Design and test approach: `docs/DESIGN.md`, `docs/TEST_PLAN.md`. How to run: `README.md`.
 
-## What was tested (all measured in the final clean run)
-Clean install (`node_modules` removed, `npm ci`) followed by:
+## What was tested (measured in the final clean run: `node_modules` removed, `npm ci`)
 | Check | Result |
 |---|---|
-| Unit and server integration tests (vitest, real sockets, real Postgres) | 75 of 75 passed (4 files) |
+| Unit and server integration tests (vitest, real sockets, real Postgres) | 209 of 209 passed (18 files) |
 | TypeScript check | no errors |
-| ESLint including the security plugin | 0 errors, 5 reviewed warnings |
-| `next build` | succeeded |
-| Browser end-to-end (two Chromium windows, Playwright) | 15 of 15 passed |
-| Hostile-input probes against a running server | 8 of 8 passed |
+| ESLint with the security plugin | 0 errors, 15 reviewed warnings |
+| `next build` (without any `.env`) | succeeded |
+| Browser end-to-end, original features (two Chromium windows) | 15 of 15 passed |
+| Browser end-to-end, new features (two to three browser contexts) | 20 of 20 passed |
+| Hostile-input probes against a running server | 12 of 12 passed |
 | XSS proof in a real browser | 7 of 7 passed |
-| Mutation check (rules broken on purpose, server tests must fail) | 16 of 16 caught |
+| Mutation checks (rules broken on purpose, tests must fail) | 49 of 49 caught across three rounds |
+| `npm audit --omit=dev` | 0 vulnerabilities |
 
-End-to-end checks cover: create board, 404 on bad ids, security headers present, two users joining, live progress visible before the stroke ends, committed stroke visible, identical picture on a 1280x800 and a 900x700 window, named cursor with percentage position, refresh persistence, late joiner, undo of own stroke only, undo after a same-tab refresh, clear with confirmation, kill and restart of the socket server with reconnect and intact history, and no uncaught page errors or CSP violations.
+The browser checks cover: owner key handling (kept in the browser, only a hash stored), editor versus owner controls, eraser limited to own strokes, redo, shapes with live preview, text with markup staying text, SVG escaping and a valid PNG, zoom and pan landing on the right canvas position, laser, rename, recent boards, a view-only visitor that cannot change anything and never receives the edit id, live updates, persistence, reconnect after killing and restarting the socket server, security headers and no CSP violations.
 
-Probes cover: 150 malformed messages (none accepted), a 560 KB message (connection closed, nothing stored), a 25,000-message flood from one socket (peer saw 84 progress and 6 cursor events, other clients kept getting acknowledgements), unknown board, SQL-style strings, undo of another user's and another board's stroke, spoofed author and board, CORS from a wrong origin (HTTP and WebSocket).
-
-An independent code review produced 18 findings. All medium and high ones were fixed (rate limiting, ghost user on disconnect during join, relay ordering, undo and clear races, missing security headers, abandoned live strokes). Details in the findings table of the build log.
+Two independent code reviews were done by a reviewer with no knowledge of the build process (18 and 17 findings). All medium and high findings were fixed, plus the cheap low ones. The review of the second round found a real flaw: a person's client id is public, so another editor could delete their strokes; strokes are now bound to a secret key.
 
 ### Measured numbers (loopback, one machine, one server process, local Postgres, Node 22.16; server cost only, not internet latency)
-Final run, samples paced under the per-socket rate limits:
+Samples are paced under the per-socket rate limits (1000 progress samples at about 33 per second, 300 commit samples at 4 per second).
+
 | Metric | samples | p50 | p95 | max |
 |---|---|---|---|---|
-| Progress relay, sender to receiver | 1000 | 0.94 ms | 1.887 ms | 9.998 ms |
-| Commit acknowledgement round trip (includes the database write) | 300 | 6.879 ms | 10.065 ms | 23.842 ms |
-| Commit relay, sender to receiver | 300 | 6.772 ms | 9.934 ms | 23.792 ms |
+| Progress relay, sender to receiver | 1000 | 1.866 ms | 2.2 ms | 4.063 ms |
+| Commit acknowledgement round trip (includes the database write) | 300 | 7.837 ms | 9.122 ms | 16.843 ms |
+| Commit relay, sender to receiver | 300 | 7.898 ms | 9.171 ms | 16.793 ms |
 
-An earlier run, made before rate limiting and per-board ordering were added and with samples sent back to back (2000 each), gave p50 0.064 / 0.606 / 0.598 ms and max 4.192 / 5.447 / 5.432 ms. The difference was not isolated: it mixes the pacing (idle gaps between samples) with the added ordering queue and limiter. The final table is the one that describes the shipped code.
+An earlier run of the same benchmark gave p50 0.94 / 6.879 / 6.772 ms (p95 1.887 / 10.065 / 9.934 ms, max 9.998 / 23.842 / 23.792 ms). The two runs differ by up to a factor of two for the relay; the cause (machine load, timer wake-ups after idle gaps, code changes in between) was not isolated, so treat the numbers as a rough scale, not a precise figure. A run before rate limiting existed, with samples sent back to back, was about ten times faster (p50 0.064 ms for the relay) and is not comparable.
 
 ## What was NOT tested
-- Real deployment (hosting, TLS, reverse proxy, HSTS, production environment variables). Next.js and the socket server were only run locally on localhost.
-- Browsers other than headless Chromium. No Firefox or Safari.
-- Phones, touch screens and pens. Pointer handling for touch and pen exists in code but was only exercised with a mouse.
-- Real-network latency, packet loss and slow connections. Only loopback was measured.
-- Multi-server scaling. Presence and relay ordering are per process; more than one socket server would need a shared adapter (not built).
-- Load with many users or many boards. Tests used a handful of clients.
-- Visual design, accessibility with screen readers and keyboard-only drawing (drawing needs a pointer).
-- The client fixes for stale live strokes, undo bound to a stroke id, and re-join after a racing clear have no dedicated automated tests; they are covered by code review and the unchanged end-to-end suite.
-- No container image was built.
+- **Container images and the compose stack were never built or run.** The Docker storage on the test machine went read-only when the disk filled up, and recovering it needs a restart of Docker Desktop, which was not done. What was checked instead: `docker compose config` validates, and the exact files the socket image copies were assembled in a clean directory with production-only dependencies and run with the image's start command (health, token-protected metrics, a join, commit and undo over a real socket, graceful shutdown on SIGTERM). Image layers, the non-root user, the health checks and the web image are unverified.
+- **The CI workflow was never run**; it was only checked to be valid YAML.
+- Real deployment (hosting, TLS, reverse proxy, forwarded headers, HSTS).
+- Browsers other than headless Chromium; no Firefox or Safari (the wheel handling for Firefox line mode is untested).
+- Phones, touch screens and pens (including pinch zoom, which does not exist) and input method editors.
+- Real-network latency, packet loss, and load with many users or boards.
+- Multi-server scaling: presence, relay order and per-address counts are per process; there is no shared adapter.
+- Accessibility with screen readers and keyboard-only drawing.
+- Client logic without dedicated tests (covered by code review and the browser suites): the stale live stroke expiry, the rejoin after a racing clear, join retry, commit retry guard and the per-author live stroke cap.
 
 ## Open findings
+- R2-01 (medium): container images, the non-root check and the compose stack are unverified (see above).
+- R2-02 (medium): the test machine's disk was completely full during this work (it has since been freed); it broke Docker and can break any build.
 - SEC-04 (low): the content security policy allows inline scripts, which Next.js needs for hydration without a nonce setup.
-- SEC-05 (medium): no cap on concurrent connections per client address; each socket is limited, but one client can open many sockets. Belongs at a reverse proxy or needs per-address accounting.
-- SEC-06 (low): board creation is not rate limited.
+- SEC-05 (medium): no total cap on connections across all addresses, and presence after a server restart is first come first served until a client leaves.
+- SEC-06 (low): without a trusted proxy, board creation uses one shared allowance for everyone.
 - SEC-08 (info): no HSTS or TLS in this repository.
-- Accepted, with reasons in the log: 8 moderate `npm audit` advisories in the lint toolchain (production dependencies report 0), the whole history being sent in the join acknowledgement (bounded by the board caps), no authentication by design.
+- Accepted with reasons in the build log: 8 moderate `npm audit` advisories in the lint toolchain only, the whole history being sent in the join acknowledgement (bounded by the board caps and compressed), no accounts by design, the owner key kept in plain text in the browser's local storage.
+
+## Not built
+Follow mode, a Redis adapter for several socket servers, and history paging or snapshots.
