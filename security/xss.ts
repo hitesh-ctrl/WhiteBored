@@ -1,6 +1,6 @@
 import { writeFileSync } from "node:fs";
 import { chromium } from "playwright";
-import { WEB, WEB_PORT, assertPortFree, enterName, sleep, startSocketServer, startWeb, waitHttp, waitUntil } from "../e2e/lib";
+import { SOCKET, SOCKET_PORT, WEB, WEB_PORT, assertPortFree, enterName, sleep, startSocketServer, startWeb, waitHttp, waitUntil } from "../e2e/lib";
 
 // Complete, working payloads that fit the 30 character name limit. Any execution opens an alert dialog.
 const SHORT = "<img src=x onerror=alert(1)>";
@@ -9,9 +9,9 @@ const nameB = "<script>alert(3)</script>";
 const results: { check: string; pass: boolean; detail: string }[] = [];
 const rec = (check: string, pass: boolean, detail: string) => { results.push({ check, pass, detail }); console.log(`${pass ? "PASS" : "FAIL"} ${check}: ${detail}`); };
 
-await assertPortFree(4000); await assertPortFree(WEB_PORT);
+await assertPortFree(SOCKET_PORT); await assertPortFree(WEB_PORT);
 const socket = startSocketServer(); const web = startWeb();
-await waitHttp("http://localhost:4000/health"); await waitHttp(WEB);
+await waitHttp(`${SOCKET}/health`); await waitHttp(WEB);
 
 const browser = await chromium.launch();
 const A = await (await browser.newContext()).newPage();

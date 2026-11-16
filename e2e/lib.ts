@@ -4,7 +4,8 @@ import type { Page } from "playwright";
 
 export const WEB_PORT = 3100;
 export const WEB = `http://localhost:${WEB_PORT}`;
-export const SOCKET = "http://localhost:4000";
+export const SOCKET_PORT = 4100;
+export const SOCKET = `http://localhost:${SOCKET_PORT}`;
 
 export function startProc(label: string, args: string[], env: Record<string, string> = {}): ChildProcess {
   const log = createWriteStream(`logs/e2e-${label}.log`, { flags: "a" });
@@ -13,7 +14,7 @@ export function startProc(label: string, args: string[], env: Record<string, str
   p.stderr?.pipe(log);
   return p;
 }
-export const startSocketServer = () => startProc("socket", ["--import", "tsx", "src/server/index.ts"], { CORS_ORIGIN: WEB });
+export const startSocketServer = () => startProc("socket", ["--import", "tsx", "src/server/index.ts"], { CORS_ORIGIN: WEB, SOCKET_PORT: String(SOCKET_PORT), MAX_CONNECTIONS_PER_IP: "500" });
 export const startWeb = () => startProc("web", ["node_modules/next/dist/bin/next", "start", "-p", String(WEB_PORT)]);
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

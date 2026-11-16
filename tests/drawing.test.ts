@@ -20,6 +20,19 @@ describe("toCanvasPoint", () => {
   });
 });
 
+describe("toCanvasPoint with a zoomed and panned view", () => {
+  const view = { zoom: 2, panX: 400, panY: 225 };
+  it("maps the corners and the middle of the displayed area into the visible part of the canvas", () => {
+    expect(toCanvasPoint(100, 50, rect, view)).toEqual([400, 225]);
+    expect(toCanvasPoint(500, 275, rect, view)).toEqual([800, 450]);
+    expect(toCanvasPoint(900, 500, rect, view)).toEqual([1200, 675]);
+  });
+  it("still rounds and clamps", () => {
+    expect(toCanvasPoint(100.13, 50.07, rect, { zoom: 1, panX: 0, panY: 0 })).toEqual([0.3, 0.1]);
+    expect(toCanvasPoint(5000, 5000, rect, view)).toEqual([1600, 900]);
+  });
+});
+
 describe("shouldAddPoint", () => {
   it("always accepts the first point", () => expect(shouldAddPoint(undefined, [1, 1])).toBe(true));
   it("skips points closer than 1 unit", () => expect(shouldAddPoint([10, 10], [10.5, 10.5])).toBe(false));

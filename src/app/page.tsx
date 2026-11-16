@@ -1,4 +1,5 @@
 import CreateBoardForm from "../components/CreateBoardForm";
+import RecentBoards from "../components/RecentBoards";
 
 export default function Home() {
   return (
@@ -8,6 +9,7 @@ export default function Home() {
         Create a board, share the link, and draw together. Anyone with the link can join.
       </p>
       <CreateBoardForm />
+      <RecentBoards />
     </main>
   );
 }

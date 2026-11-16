@@ -1,4 +1,5 @@
 import { CANVAS_HEIGHT, CANVAS_WIDTH, MAX_POINTS_PER_BATCH } from "../shared/limits";
+import { DEFAULT_VIEW, screenToCanvas, type View } from "./viewport";
 
 export type Point = [number, number];
 export type RectLike = { left: number; top: number; width: number; height: number };
@@ -6,11 +7,13 @@ export type RectLike = { left: number; top: number; width: number; height: numbe
 const round1 = (n: number) => Math.round(n * 10) / 10;
 const clamp = (n: number, max: number) => Math.min(max, Math.max(0, n));
 
-/** Map screen coordinates to the logical canvas: scaled, rounded to 1 decimal, clamped. */
-export function toCanvasPoint(clientX: number, clientY: number, rect: RectLike): Point {
+/**
+ * Map screen coordinates to the logical canvas: through the current zoom and pan, rounded to
+ * 1 decimal and clamped.
+ */
+export function toCanvasPoint(clientX: number, clientY: number, rect: RectLike, view: View = DEFAULT_VIEW): Point {
   if (rect.width <= 0 || rect.height <= 0) return [0, 0];
-  const x = ((clientX - rect.left) / rect.width) * CANVAS_WIDTH;
-  const y = ((clientY - rect.top) / rect.height) * CANVAS_HEIGHT;
+  const [x, y] = screenToCanvas(view, (clientX - rect.left) / rect.width, (clientY - rect.top) / rect.height);
   return [clamp(round1(x), CANVAS_WIDTH), clamp(round1(y), CANVAS_HEIGHT)];
 }
 

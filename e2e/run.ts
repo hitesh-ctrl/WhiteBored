@@ -1,7 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { chromium } from "playwright";
 import {
-  SOCKET, WEB, WEB_PORT, assertPortFree, enterName, exited, ink, sleep, startSocketServer, startWeb, status, stroke, waitHttp, waitUntil,
+  SOCKET, WEB, SOCKET_PORT, WEB_PORT, assertPortFree, enterName, exited, ink, sleep, startSocketServer, startWeb, status, stroke, waitHttp, waitUntil,
 } from "./lib";
 
 const results: { check: string; pass: boolean; detail?: string }[] = [];
@@ -17,7 +17,7 @@ async function check(name: string, fn: () => Promise<string | void>) {
 }
 const shot = (page: import("playwright").Page, n: string) => page.screenshot({ path: `logs/evidence/${n}.png` });
 
-await assertPortFree(4000);
+await assertPortFree(SOCKET_PORT);
 await assertPortFree(WEB_PORT);
 let socketProc = startSocketServer();
 const web = startWeb();

@@ -3,7 +3,7 @@ import { KeyedLimiter } from "../src/lib/keyedLimiter";
 
 describe("KeyedLimiter", () => {
   it("allows the burst per key and then refuses", () => {
-    let t = 0;
+    const t = 0;
     const l = new KeyedLimiter({ burst: 5, perMinute: 5, now: () => t });
     expect([1, 2, 3, 4, 5].every(() => l.allow("ip-1"))).toBe(true);
     expect(l.allow("ip-1")).toBe(false);

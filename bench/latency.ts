@@ -3,21 +3,21 @@ import { randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { io } from "socket.io-client";
 import { createPrisma } from "../src/lib/prisma";
-import { assertPortFree, exited, sleep, startSocketServer, waitHttp } from "../e2e/lib";
+import { SOCKET, SOCKET_PORT, assertPortFree, exited, sleep, startSocketServer, waitHttp } from "../e2e/lib";
 
 // The server limits each socket (40 progress/s, 5 commits/s), so samples are paced below those
 // rates. Hitting the limit would measure the limiter, not the relay.
 const N_PROGRESS = 1000, PROGRESS_GAP_MS = 30; // about 33 per second
 const N_COMMIT = 300, COMMIT_GAP_MS = 250; // 4 per second
 const WARMUP = 20;
-await assertPortFree(4000);
+await assertPortFree(SOCKET_PORT);
 const prisma = createPrisma();
 const board = await prisma.board.create({ data: { name: "bench" } });
 const server = startSocketServer();
-await waitHttp("http://localhost:4000/health");
+await waitHttp(`${SOCKET}/health`);
 
 const connect = async (name: string) => {
-  const s = io("http://localhost:4000", { transports: ["websocket"], forceNew: true });
+  const s = io(SOCKET, { transports: ["websocket"], forceNew: true });
   await new Promise<void>((r) => s.once("connect", () => r()));
   const ack = await s.emitWithAck("board:join", { boardId: board.id, clientId: randomUUID(), name });
   if (!ack.ok) throw new Error("join failed");

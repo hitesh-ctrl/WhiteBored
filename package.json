@@ -19,7 +19,7 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "e2e": "tsx e2e/run.ts",
+    "e2e": "NEXT_PUBLIC_SOCKET_URL=http://localhost:4100 next build && tsx e2e/run.ts && tsx e2e/features.ts",
     "probes": "tsx security/probes.ts",
     "xss": "tsx security/xss.ts",
     "bench": "tsx bench/latency.ts"

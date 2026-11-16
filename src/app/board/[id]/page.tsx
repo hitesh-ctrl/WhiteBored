@@ -1,7 +1,10 @@
+import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import Board from "../../../components/Board";
 import { prisma } from "../../../lib/db";
 import { idSchema } from "../../../shared/protocol";
+
+export const metadata: Metadata = { robots: { index: false, follow: false } };
 
 export default async function BoardPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;

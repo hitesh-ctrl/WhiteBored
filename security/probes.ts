@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { io, type Socket } from "socket.io-client";
 import { createPrisma } from "../src/lib/prisma";
-import { SOCKET, WEB, assertPortFree, exited, sleep, startSocketServer, waitHttp } from "../e2e/lib";
+import { SOCKET, SOCKET_PORT, WEB, assertPortFree, exited, sleep, startSocketServer, waitHttp } from "../e2e/lib";
 
 const results: { probe: string; pass: boolean; detail: string }[] = [];
 async function probe(name: string, fn: () => Promise<string>) {
@@ -13,7 +13,7 @@ async function probe(name: string, fn: () => Promise<string>) {
 const must = (c: unknown, msg: string) => { if (!c) throw new Error(msg); };
 const health = async () => (await fetch(`${SOCKET}/health`)).status === 200;
 
-await assertPortFree(4000);
+await assertPortFree(SOCKET_PORT);
 const prisma = createPrisma();
 const board = await prisma.board.create({ data: { name: "probe board" } });
 const other = await prisma.board.create({ data: { name: "probe board 2" } });
